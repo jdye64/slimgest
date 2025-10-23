@@ -5,17 +5,35 @@ PDF-to-image OCR pipeline with a FastAPI server and CLIs, using a shared core fo
 
 Install
 -------
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-```
+We recommend using [uv](https://github.com/astral-sh/uv) for a faster and more reproducible install.
 
-- Download the vllm-0.8.5 for your system architecture and install [whl](https://github.com/vllm-project/vllm/releases/tag/v0.8.5)
-```Shell
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu118
-pip install vllm-0.8.5+cu118-cp38-abi3-manylinux1_x86_64.whl
-pip install flash-attn==2.7.3 --no-build-isolation
-```
+1. **Create a virtual environment (optional but recommended):**
+   ```bash
+   python -m venv .venv && source .venv/bin/activate
+   ```
+
+2. **Install all dependencies + project in editable mode via uv:**
+   ```bash
+   uv pip install -e .
+   ```
+   This will install all dependencies specified in the `pyproject.toml`, including those needed for CLI and conversion.
+
+3. **For GPU/cuda and vLLM:**
+   The following are not installable directly via PyPI and need to be installed manually. After activating your environment and running `uv pip install -e .`, do:
+
+   - Download the correct vLLM wheel for your architecture from [the vLLM releases page](https://github.com/vllm-project/vllm/releases/tag/v0.8.5).
+
+   - Install necessary CUDA wheels (example for CUDA 11.8 and Python 3.10+):
+     ```bash
+     uv pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu118
+     uv pip install /path/to/vllm-0.8.5+cu118-cp38-abi3-manylinux1_x86_64.whl
+     uv pip install flash-attn==2.7.3 --no-build-isolation
+     ```
+
+   *(Adjust the vLLM and CUDA wheel path/names as needed for your Python version and GPU architecture.)*
+
+**Note:** Most dependencies are specified in `pyproject.toml` for easier install with `uv`. However, binary packages like `vllm` and some CUDA-specific wheels cannot be distributed via PyPI and must be installed manually as above.
+
 
 Run the server (TODO/placeholder: Do not use yet ...)
 --------------
