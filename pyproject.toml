@@ -22,6 +22,7 @@ dependencies = [
   "pillow>=10.3.0",
   "numpy>=1.26.0",
   "pymupdf>=1.24.0",
+  "pypdfium2>=4.27.0",
   "python-multipart>=0.0.9",
   "tqdm>=4.67.1",
   "transformers==4.46.3",
@@ -41,6 +42,7 @@ Homepage = "https://example.com"
 [project.scripts]
 slimgest = "slimgest.cli.__main__:main"
 slimgest-local = "slimgest.cli.local:app"
+pdf2img = "slimgest.cli.utils.pdf_utils:app"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
