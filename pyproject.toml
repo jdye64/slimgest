@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slimgest"
+version = "0.1.0"
+description = "PDF-to-image OCR pipeline with FastAPI server and CLI (vLLM DeepSeek OCR)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "slim-gest" }
+]
+dependencies = [
+  "fastapi>=0.114.0",
+  "uvicorn[standard]>=0.30.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.8.0",
+  "typer>=0.12.0",
+  "rich>=13.7.0",
+  "pillow>=10.3.0",
+  "numpy>=1.26.0",
+  "pymupdf>=1.24.0",
+  "python-multipart>=0.0.9",
+  "tqdm>=4.67.1",
+  "transformers==4.46.3",
+  "tokenizers==0.20.3",
+  "PyMuPDF",
+  "img2pdf",
+  "einops",
+  "easydict",
+  "addict",
+  "Pillow",
+  "numpy",
+]
+
+[project.urls]
+Homepage = "https://example.com"
+
+[project.scripts]
+slimgest = "slimgest.cli.__main__:main"
+slimgest-local = "slimgest.cli.local:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["slimgest*"]
+exclude = []
+
+

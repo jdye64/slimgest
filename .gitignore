@@ -1,0 +1,28 @@
+# Python virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+.ENV/
+env.bak/
+.venv.bak/
+env*/ 
+.venv*/ 
+
+# Python build cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pydc
+*.pdb
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Output and results
+bo20_results/
+
