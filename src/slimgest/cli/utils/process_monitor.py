@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from datetime import datetime
+import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for server environments
 import matplotlib.pyplot as plt
@@ -59,6 +60,9 @@ class ProcessMonitor:
         self.gpu_count = 0
         self.gpu_names: List[str] = []
         self.gpu_enabled = False
+        
+        # Stage/phase annotations for the X-axis
+        self.stage_annotations: List[Dict[str, Any]] = []  # List of {timestamp, stage_name}
         
         # Initial disk I/O counters for calculating deltas
         self._last_disk_read = 0
@@ -138,6 +142,21 @@ class ProcessMonitor:
         self.monitor_thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.monitor_thread.start()
         
+    def annotate_stage(self, stage_name: str):
+        """
+        Annotate the current time with a processing stage name.
+        This will be displayed on graphs as vertical lines or markers.
+        
+        Args:
+            stage_name: Name of the processing stage (e.g., "PDF Splitting", "Page Elements")
+        """
+        if self._start_time is not None:
+            elapsed_time = time.time() - self._start_time
+            self.stage_annotations.append({
+                'timestamp': elapsed_time,
+                'stage_name': stage_name
+            })
+    
     def stop(self):
         """Stop monitoring."""
         self.monitoring = False
@@ -372,7 +391,8 @@ class ProcessMonitor:
                 **gpu_metadata
             },
             "time_series": time_series_data,
-            "summary": summary_stats
+            "summary": summary_stats,
+            "stage_annotations": self.stage_annotations  # Add stage annotations
         }
         
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -504,6 +524,35 @@ class ProcessMonitor:
             ax6.grid(True, alpha=0.3)
             if self.gpu_count <= 4:  # Only show legend if not too many GPUs
                 ax6.legend(loc='upper right', fontsize=8)
+        
+        # Add stage annotations to all subplots
+        if self.stage_annotations:
+            # Convert stage timestamps to minutes
+            stage_colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A', '#98D8C8', '#F7DC6F']
+            
+            # Flatten axes array for easy iteration
+            all_axes = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
+            
+            for annotation_idx, annotation in enumerate(self.stage_annotations):
+                stage_time_min = annotation['timestamp'] / 60
+                stage_name = annotation['stage_name']
+                color = stage_colors[annotation_idx % len(stage_colors)]
+                
+                # Add vertical line to each subplot
+                for ax in all_axes:
+                    ax.axvline(x=stage_time_min, color=color, linestyle='--', 
+                              linewidth=1.5, alpha=0.7, zorder=5)
+                
+                # Add stage label on the top subplot only (to avoid clutter)
+                top_ax = all_axes[0]
+                # Position label slightly above the plot
+                y_pos = top_ax.get_ylim()[1]
+                top_ax.text(stage_time_min, y_pos, f' {stage_name}', 
+                          rotation=90, verticalalignment='bottom', 
+                          horizontalalignment='right',
+                          fontsize=8, color=color, weight='bold',
+                          bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                                   edgecolor=color, alpha=0.8))
         
         # Adjust layout to prevent overlap
         plt.tight_layout(rect=[0, 0.03, 1, 0.97])

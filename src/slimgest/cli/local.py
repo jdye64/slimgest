@@ -712,6 +712,7 @@ def process(
     console.print(f"[bold cyan]Starting process monitoring for CPU, memory, and disk I/O[/bold cyan]")
     monitor = ProcessMonitor(sample_interval=1.0)
     monitor.start()
+    monitor.annotate_stage("Initialization")
     
     # Track total runtime and OCR invocations
     total_start_time = time.perf_counter()
@@ -753,6 +754,9 @@ def process(
         max_workers=parallel_workers,
         initializer=_initialize_worker_process
     ) as executor:
+        # Note: Model loading happens inside worker initializer
+        monitor.annotate_stage("Loading Models")
+        
         # Submit all PDF processing jobs
         future_to_pdf = {
             executor.submit(
@@ -764,9 +768,16 @@ def process(
         }
         
         # Process completed jobs with progress bar
+        first_result = True
         with tqdm(total=len(pdf_files), desc="Processing PDFs") as pbar:
             for future in as_completed(future_to_pdf):
                 pdf_path = future_to_pdf[future]
+                
+                # Annotate PDF processing stage after first result starts
+                if first_result:
+                    monitor.annotate_stage("PDF Processing")
+                    first_result = False
+                
                 try:
                     pdf_name, pdf_metrics, counters = future.result()
                     all_pdf_metrics[pdf_name] = pdf_metrics
@@ -803,6 +814,7 @@ def process(
                     pbar.update(1)
 
     # Save overall metrics
+    monitor.annotate_stage("Saving Results")
     save_metrics(all_pdf_metrics, scratch["metrics"], "ALL_PDFS")
 
     # Calculate total runtime
