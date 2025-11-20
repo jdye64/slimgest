@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  slimgest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: slimgest:latest
+    container_name: slimgest
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount directories for persistent data
+      - ./data:/app/data
+      - ./extracts:/app/extracts
+    environment:
+      # Environment variables (customize as needed)
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    # GPU support enabled
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+

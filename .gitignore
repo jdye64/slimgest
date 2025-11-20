@@ -10,6 +10,9 @@ env.bak/
 env*/ 
 .venv*/ 
 
+scratch/
+nemotron-wheels/
+
 # Python build cache
 __pycache__/
 *.pyc
