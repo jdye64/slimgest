@@ -463,6 +463,290 @@ def save_metrics(metrics: Dict[str, Any], out_dir: Path, pdf_name: str):
         json.dump(metrics, f, indent=2)
 
 
+def extract_all_pages_from_pdfs(
+    pdf_files: List[Path],
+    scratch_dict: Dict[str, str]
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Extract all pages from all PDFs into individual page PDFs.
+    
+    This is Phase 1 - preparing all pages before processing begins.
+    
+    Args:
+        pdf_files: List of PDF file paths to process
+        scratch_dict: Dictionary of scratch directory paths (as strings)
+        
+    Returns:
+        Tuple of (page_list, extraction_metrics) where:
+        - page_list is a list of dicts with page info (page_pdf_path, pdf_name, page_num, etc.)
+        - extraction_metrics contains timing and statistics about the extraction
+    """
+    scratch = {k: Path(v) for k, v in scratch_dict.items()}
+    
+    page_list = []
+    extraction_metrics = {
+        'total_pdfs': len(pdf_files),
+        'total_pages': 0,
+        'pdf_details': {},
+        'failed_pdfs': []
+    }
+    
+    start_time = time.perf_counter()
+    
+    for pdf_path in pdf_files:
+        try:
+            # Copy input PDF to scratch directory
+            input_pdf_copy = scratch["input_pdf"] / pdf_path.name
+            shutil.copy2(pdf_path, input_pdf_copy)
+            
+            # Split PDF into pages
+            pdf_start = time.perf_counter()
+            page_pdfs = split_pdf_to_pages(pdf_path, scratch["pdf_pages"])
+            pdf_end = time.perf_counter()
+            
+            # Track metadata for each page
+            for page_idx, page_pdf_path in enumerate(page_pdfs):
+                page_list.append({
+                    'page_pdf_path': page_pdf_path,
+                    'pdf_name': pdf_path.name,
+                    'pdf_stem': pdf_path.stem,
+                    'page_num': page_idx + 1,
+                    'total_pages_in_pdf': len(page_pdfs),
+                    'input_pdf_copy': str(input_pdf_copy)
+                })
+            
+            extraction_metrics['pdf_details'][pdf_path.name] = {
+                'num_pages': len(page_pdfs),
+                'duration_sec': pdf_end - pdf_start,
+                'input_pdf_copy': str(input_pdf_copy)
+            }
+            extraction_metrics['total_pages'] += len(page_pdfs)
+            
+        except Exception as e:
+            error_msg = str(e)
+            if "Failed to load document" in error_msg or "PDFium" in error_msg:
+                error_msg = "Corrupted or invalid PDF file"
+            elif "password" in error_msg.lower():
+                error_msg = "Password-protected PDF"
+            
+            extraction_metrics['failed_pdfs'].append({
+                'filename': pdf_path.name,
+                'error': error_msg
+            })
+    
+    end_time = time.perf_counter()
+    extraction_metrics['total_duration_sec'] = end_time - start_time
+    
+    return page_list, extraction_metrics
+
+
+def process_single_page(
+    page_info: Dict[str, Any],
+    scratch_dict: Dict[str, str]
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Process a single PDF page and return its metrics.
+    
+    This function runs in a worker process with models already loaded
+    via the process initializer.
+    
+    Args:
+        page_info: Dictionary containing page metadata (page_pdf_path, pdf_name, page_num, etc.)
+        scratch_dict: Dictionary of scratch directory paths (as strings)
+        
+    Returns:
+        Tuple of (page_metrics, counters) where:
+        - page_metrics contains all processing results for this page
+        - counters contains counts and timings for aggregation
+    """
+    global _process_models
+    
+    # Convert scratch dict back to Path objects
+    scratch = {k: Path(v) for k, v in scratch_dict.items()}
+    
+    # Get models from process-local storage
+    page_elements_model = _process_models['page_elements']
+    table_structure_model = _process_models['table_structure']
+    graphic_elements_model = _process_models['graphic_elements']
+    
+    # Extract page info
+    page_pdf_path = page_info['page_pdf_path']
+    pdf_name = page_info['pdf_name']
+    pdf_stem = page_info['pdf_stem']
+    page_num = page_info['page_num']
+    
+    # Initialize counters for this page
+    counters = {
+        'page_count': 1,
+        'table_count': 0,
+        'graphic_count': 0,
+        'ocr_count': 0,
+        'time_page_to_png': 0.0,
+        'time_page_elements': 0.0,
+        'time_crop_elements': 0.0,
+        'time_table_structure': 0.0,
+        'time_graphic_elements': 0.0
+    }
+    
+    # Local OCR counter for this page
+    local_ocr_counter = {'count': 0}
+    
+    page_metrics = {
+        'pdf_name': pdf_name,
+        'page_num': page_num,
+        'page_pdf': str(page_pdf_path)
+    }
+    
+    # PDF → PNG step
+    step1_start = time.perf_counter()
+    img_path = pdf_page_to_png(page_pdf_path, scratch["page_images"])
+    step1_end = time.perf_counter()
+    png_time = step1_end - step1_start
+    page_metrics["pdf_page_to_png"] = {"duration_sec": png_time, "image": str(img_path)}
+    counters['time_page_to_png'] = png_time
+    
+    # PNG → page elements step
+    step2_start = time.perf_counter()
+    elem_json_path = run_nemotron_page_elements(img_path, scratch["page_elements"], page_elements_model)
+    step2_end = time.perf_counter()
+    page_elements_time = step2_end - step2_start
+    page_metrics["run_nemotron_page_elements"] = {
+        "duration_sec": page_elements_time,
+        "elements_json": str(elem_json_path),
+    }
+    counters['time_page_elements'] = page_elements_time
+    
+    # Crop individual elements from page
+    step3_start = time.perf_counter()
+    cropped_elements = crop_page_elements(img_path, elem_json_path, scratch["cropped_elements"])
+    step3_end = time.perf_counter()
+    crop_time = step3_end - step3_start
+    page_metrics["crop_page_elements"] = {
+        "duration_sec": crop_time,
+        "num_cropped": len(cropped_elements),
+        "cropped_elements": cropped_elements
+    }
+    counters['time_crop_elements'] = crop_time
+    
+    # Process each cropped element based on its type
+    table_structure_results = []
+    table_structure_total_time = 0.0
+    graphic_elements_results = []
+    graphic_elements_total_time = 0.0
+    
+    for cropped_info in cropped_elements:
+        crop_path = Path(cropped_info["crop_path"])
+        label = cropped_info["label"]
+        element_index = cropped_info["element_index"]
+        
+        # Call appropriate function based on label
+        if label == "table":
+            step4_start = time.perf_counter()
+            table_elements = run_nemotron_table_structure(crop_path, scratch["table_structure"], table_structure_model)
+            step4_end = time.perf_counter()
+            table_duration = step4_end - step4_start
+            table_structure_total_time += table_duration
+            
+            # Increment table counter and timing
+            counters['table_count'] += 1
+            counters['time_table_structure'] += table_duration
+            
+            # Save table structure to JSON file
+            json_filename = f"{page_pdf_path.stem}_element_{element_index:03d}_table_structure.json"
+            json_file = scratch["table_structure"] / json_filename
+            
+            table_result = {
+                "source_image": str(crop_path),
+                "detections": table_elements,
+                "num_detections": len(table_elements),
+                "page_number": page_num,
+                "element_index": element_index,
+                "duration_sec": table_duration
+            }
+            
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(table_result, f, ensure_ascii=False, indent=2)
+            
+            table_structure_results.append({
+                "json_file": str(json_file),
+                "duration_sec": table_duration,
+                "num_detections": len(table_elements)
+            })
+            
+        elif label in ["figure", "graphic", "image", "chart"]:
+            step5_start = time.perf_counter()
+            graphic_elements = run_nemotron_graphic_elements(crop_path, scratch["graphic_elements"], graphic_elements_model)
+            step5_end = time.perf_counter()
+            graphic_duration = step5_end - step5_start
+            graphic_elements_total_time += graphic_duration
+            
+            # Increment graphic counter and timing
+            counters['graphic_count'] += 1
+            counters['time_graphic_elements'] += graphic_duration
+            
+            # Create subdirectory for this graphic's OCR crops
+            graphic_ocr_subdir = scratch["graphic_ocr_crops"] / f"{page_pdf_path.stem}_element_{element_index:03d}"
+            graphic_ocr_subdir.mkdir(parents=True, exist_ok=True)
+            
+            # Crop each detection and run OCR
+            for det_idx, detection in enumerate(graphic_elements):
+                bbox = detection["bbox"]
+                det_label = detection["label"]
+                
+                # Crop the detection from the graphic image
+                crop_filename = f"detection_{det_idx:03d}_{det_label}.png"
+                crop_output_path = graphic_ocr_subdir / crop_filename
+                crop_detection_from_image(crop_path, bbox, crop_output_path)
+                
+                # Run OCR on the cropped detection
+                ocr_text = run_nemotron_ocr(crop_output_path, local_ocr_counter)
+                
+                # Add OCR results to detection
+                detection["ocr_crop_path"] = str(crop_output_path)
+                detection["ocr_text"] = ocr_text
+            
+            # Save graphic elements to JSON file
+            json_filename = f"{page_pdf_path.stem}_element_{element_index:03d}_graphic_elements.json"
+            json_file = scratch["graphic_elements"] / json_filename
+            
+            graphic_result = {
+                "source_image": str(crop_path),
+                "detections": graphic_elements,
+                "num_detections": len(graphic_elements),
+                "page_number": page_num,
+                "element_index": element_index,
+                "duration_sec": graphic_duration
+            }
+            
+            with open(json_file, "w", encoding="utf-8") as f:
+                json.dump(graphic_result, f, ensure_ascii=False, indent=2)
+            
+            graphic_elements_results.append({
+                "json_file": str(json_file),
+                "duration_sec": graphic_duration,
+                "num_detections": len(graphic_elements)
+            })
+    
+    # Add table structure metrics to page metrics
+    if table_structure_results:
+        page_metrics["run_nemotron_table_structure"] = {
+            "duration_sec": table_structure_total_time,
+            "num_tables": len(table_structure_results),
+            "tables": table_structure_results
+        }
+    
+    # Add graphic elements metrics to page metrics
+    if graphic_elements_results:
+        page_metrics["run_nemotron_graphic_elements"] = {
+            "duration_sec": graphic_elements_total_time,
+            "num_graphics": len(graphic_elements_results),
+            "graphics": graphic_elements_results
+        }
+    
+    # Add OCR count to counters
+    counters['ocr_count'] = local_ocr_counter['count']
+    
+    return (page_metrics, counters)
+
+
 def process_single_pdf(
     pdf_path: Path,
     scratch_dict: Dict[str, str]
@@ -731,13 +1015,40 @@ def process(
 
     console.print(f"[bold]Found {len(pdf_files)} PDF files to process[/bold]")
     
+    # ====================================================================
+    # PHASE 1: Extract all pages from all PDFs first
+    # ====================================================================
+    console.print(f"\n[bold cyan]Phase 1: Extracting all pages from PDFs...[/bold cyan]")
+    monitor.annotate_stage("Page Extraction")
+    
+    extraction_start = time.perf_counter()
+    page_list, extraction_metrics = extract_all_pages_from_pdfs(pdf_files, scratch_dict)
+    extraction_end = time.perf_counter()
+    extraction_time = extraction_end - extraction_start
+    
+    console.print(f"[green]✓[/green] Extracted {extraction_metrics['total_pages']:,} pages from {extraction_metrics['total_pdfs']} PDFs in {extraction_time:.2f}s")
+    
+    failed_pdfs = extraction_metrics['failed_pdfs']
+    if failed_pdfs:
+        console.print(f"[yellow]⚠[/yellow] {len(failed_pdfs)} PDFs failed during extraction")
+    
+    if not page_list:
+        console.print("[red]No pages were successfully extracted![/red]")
+        raise typer.Exit(1)
+    
+    # ====================================================================
+    # PHASE 2: Process all pages with even distribution across workers
+    # ====================================================================
+    console.print(f"\n[bold cyan]Phase 2: Processing pages with {parallel_workers} workers...[/bold cyan]")
+    console.print(f"[bold]Pages will be evenly distributed for optimal GPU utilization[/bold]")
+    
     # Initialize global counters for statistics
     global_counters = {
         'total_pages': 0,
         'total_tables': 0,
         'total_graphics': 0,
         'total_ocr': 0,
-        'time_pdf_split': 0.0,
+        'time_pdf_split': extraction_time,  # Count extraction as split time
         'time_page_to_png': 0.0,
         'time_page_elements': 0.0,
         'time_crop_elements': 0.0,
@@ -745,8 +1056,8 @@ def process(
         'time_graphic_elements': 0.0
     }
     
-    # Track failed PDFs
-    failed_pdfs = []
+    # Store page results for aggregation by PDF
+    page_results = []
     
     # Use multiprocessing for parallel processing (pypdfium2 is not thread-safe)
     # Each process loads models once via initializer
@@ -757,30 +1068,30 @@ def process(
         # Note: Model loading happens inside worker initializer
         monitor.annotate_stage("Loading Models")
         
-        # Submit all PDF processing jobs
-        future_to_pdf = {
+        # Submit all page processing jobs (evenly distributed)
+        future_to_page = {
             executor.submit(
-                process_single_pdf,
-                pdf_path,
+                process_single_page,
+                page_info,
                 scratch_dict
-            ): pdf_path
-            for pdf_path in pdf_files
+            ): page_info
+            for page_info in page_list
         }
         
         # Process completed jobs with progress bar
         first_result = True
-        with tqdm(total=len(pdf_files), desc="Processing PDFs") as pbar:
-            for future in as_completed(future_to_pdf):
-                pdf_path = future_to_pdf[future]
+        with tqdm(total=len(page_list), desc="Processing Pages") as pbar:
+            for future in as_completed(future_to_page):
+                page_info = future_to_page[future]
                 
-                # Annotate PDF processing stage after first result starts
+                # Annotate page processing stage after first result starts
                 if first_result:
-                    monitor.annotate_stage("PDF Processing")
+                    monitor.annotate_stage("Page Processing")
                     first_result = False
                 
                 try:
-                    pdf_name, pdf_metrics, counters = future.result()
-                    all_pdf_metrics[pdf_name] = pdf_metrics
+                    page_metrics, counters = future.result()
+                    page_results.append(page_metrics)
                     
                     # Aggregate global counters
                     global_counters['total_pages'] += counters['page_count']
@@ -789,29 +1100,70 @@ def process(
                     global_counters['total_ocr'] += counters['ocr_count']
                     
                     # Aggregate timing information
-                    global_counters['time_pdf_split'] += counters['time_pdf_split']
                     global_counters['time_page_to_png'] += counters['time_page_to_png']
                     global_counters['time_page_elements'] += counters['time_page_elements']
                     global_counters['time_crop_elements'] += counters['time_crop_elements']
                     global_counters['time_table_structure'] += counters['time_table_structure']
                     global_counters['time_graphic_elements'] += counters['time_graphic_elements']
                     
-                    console.print(f"[green]✓[/green] Completed: {pdf_name}")
                 except Exception as exc:
                     error_msg = str(exc)
-                    # Simplify common error messages
-                    if "Failed to load document" in error_msg or "PDFium" in error_msg:
-                        error_msg = "Corrupted or invalid PDF file"
-                    elif "password" in error_msg.lower():
-                        error_msg = "Password-protected PDF"
-                    
-                    console.print(f"[red]✗[/red] {pdf_path.name}: {error_msg}")
-                    failed_pdfs.append({
-                        'filename': pdf_path.name,
-                        'error': error_msg
-                    })
+                    console.print(f"[red]✗[/red] Page {page_info['pdf_name']} p{page_info['page_num']}: {error_msg}")
                 finally:
                     pbar.update(1)
+    
+    # ====================================================================
+    # Aggregate page results back into per-PDF metrics
+    # ====================================================================
+    console.print(f"\n[bold cyan]Aggregating results by PDF...[/bold cyan]")
+    
+    # Group page results by PDF
+    from collections import defaultdict
+    pdf_page_groups = defaultdict(list)
+    for page_result in page_results:
+        pdf_name = page_result['pdf_name']
+        pdf_page_groups[pdf_name].append(page_result)
+    
+    # Create per-PDF metrics
+    for pdf_name, pages in pdf_page_groups.items():
+        # Sort pages by page number
+        pages.sort(key=lambda x: x['page_num'])
+        
+        # Get PDF details from extraction metrics
+        pdf_details = extraction_metrics['pdf_details'].get(pdf_name, {})
+        
+        pdf_metrics = {
+            'input_pdf_copy': pdf_details.get('input_pdf_copy', ''),
+            'split_pdf_to_pages': {
+                'duration_sec': pdf_details.get('duration_sec', 0.0),
+                'num_pages': len(pages)
+            },
+            'total_pages': len(pages),
+            'pages': {}
+        }
+        
+        # Add each page's metrics
+        for page_result in pages:
+            page_key = f"page_{page_result['page_num']}"
+            pdf_metrics['pages'][page_key] = {
+                'page_num': page_result['page_num'],
+                'pdf_page_to_png': page_result.get('pdf_page_to_png', {}),
+                'run_nemotron_page_elements': page_result.get('run_nemotron_page_elements', {}),
+                'crop_page_elements': page_result.get('crop_page_elements', {}),
+            }
+            
+            # Add optional table/graphic results if present
+            if 'run_nemotron_table_structure' in page_result:
+                pdf_metrics['pages'][page_key]['run_nemotron_table_structure'] = page_result['run_nemotron_table_structure']
+            if 'run_nemotron_graphic_elements' in page_result:
+                pdf_metrics['pages'][page_key]['run_nemotron_graphic_elements'] = page_result['run_nemotron_graphic_elements']
+        
+        all_pdf_metrics[pdf_name] = pdf_metrics
+        
+        # Save per-PDF metrics
+        pdf_stem = Path(pdf_name).stem
+        save_metrics(pdf_metrics, scratch["metrics"], pdf_stem)
+        console.print(f"[green]✓[/green] Aggregated metrics for: {pdf_name}")
 
     # Save overall metrics
     monitor.annotate_stage("Saving Results")
@@ -835,7 +1187,13 @@ def process(
     console.print(f"  • Total PDFs: {total_pdfs}")
     console.print(f"  • [green]Successful: {successful_count}[/green]")
     if failed_count > 0:
-        console.print(f"  • [red]Failed: {failed_count}[/red]")
+        console.print(f"  • [red]Failed (during extraction): {failed_count}[/red]")
+    
+    console.print(f"\n[bold]Two-Phase Processing:[/bold]")
+    console.print(f"  • Phase 1 (Page Extraction): {extraction_time:.2f}s")
+    console.print(f"  • Phase 2 (Page Processing): {total_runtime - extraction_time:.2f}s")
+    console.print(f"  • Total pages extracted: {extraction_metrics['total_pages']:,}")
+    console.print(f"  • Total pages processed: {len(page_results):,}")
     
     # Calculate total cumulative processing time first
     total_cumulative_time = (

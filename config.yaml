@@ -3,5 +3,5 @@
 # Number of PDF files to process in parallel
 # Higher values will use more CPU cores but process faster
 # Default: 10
-parallel_workers: 10
+parallel_workers: 20
 
