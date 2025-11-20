@@ -17,6 +17,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pypdfium2
 
+from .utils.process_monitor import ProcessMonitor
+
 from nemotron_page_elements_v3.model import define_model as define_page_elements_model
 
 from nemotron_table_structure_v1.table_structure_v1 import Exp
@@ -706,6 +708,11 @@ def process(
     console.print(f"[bold cyan]Using {parallel_workers} parallel workers for PDF processing[/bold cyan]")
     console.print(f"[bold]Models will be loaded once per worker process[/bold]")
     
+    # Initialize process monitoring
+    console.print(f"[bold cyan]Starting process monitoring for CPU, memory, and disk I/O[/bold cyan]")
+    monitor = ProcessMonitor(sample_interval=1.0)
+    monitor.start()
+    
     # Track total runtime and OCR invocations
     total_start_time = time.perf_counter()
     
@@ -818,19 +825,8 @@ def process(
     if failed_count > 0:
         console.print(f"  • [red]Failed: {failed_count}[/red]")
     
-    # Statistics
-    console.print(f"\n[bold]Processing Statistics:[/bold]")
-    console.print(f"  • Total pages processed: {global_counters['total_pages']:,}")
-    console.print(f"  • Total tables processed: {global_counters['total_tables']:,}")
-    console.print(f"  • Total graphics processed: {global_counters['total_graphics']:,}")
-    console.print(f"  • Total OCR invocations: {global_counters['total_ocr']:,}")
-    console.print(f"  • Total runtime: {total_runtime:.2f} seconds ({total_runtime/60:.2f} minutes)")
-    
-    # Timing breakdown with percentages
-    console.print(f"\n[bold]Time Breakdown:[/bold]")
-    
-    # Calculate total tracked time
-    total_tracked_time = (
+    # Calculate total cumulative processing time first
+    total_cumulative_time = (
         global_counters['time_pdf_split'] +
         global_counters['time_page_to_png'] +
         global_counters['time_page_elements'] +
@@ -839,7 +835,23 @@ def process(
         global_counters['time_graphic_elements']
     )
     
-    # Display each step with time and percentage
+    # Statistics
+    console.print(f"\n[bold]Processing Statistics:[/bold]")
+    console.print(f"  • Total pages processed: {global_counters['total_pages']:,}")
+    console.print(f"  • Total tables processed: {global_counters['total_tables']:,}")
+    console.print(f"  • Total graphics processed: {global_counters['total_graphics']:,}")
+    console.print(f"  • Total OCR invocations: {global_counters['total_ocr']:,}")
+    console.print(f"\n[bold]Runtime:[/bold]")
+    console.print(f"  • Wall time (actual): {total_runtime:.2f} seconds ({total_runtime/60:.2f} minutes)")
+    console.print(f"  • Cumulative compute time: {total_cumulative_time:.2f} seconds ({total_cumulative_time/60:.2f} minutes)")
+    if total_runtime > 0:
+        speedup = total_cumulative_time / total_runtime
+        console.print(f"  • Parallel speedup: {speedup:.1f}x with {parallel_workers} workers")
+    
+    # Timing breakdown with percentages
+    console.print(f"\n[bold]Time Breakdown (by processing step):[/bold]")
+    
+    # Display each step with time and percentage of cumulative time
     steps = [
         ("PDF Splitting", global_counters['time_pdf_split']),
         ("Page to PNG", global_counters['time_page_to_png']),
@@ -850,15 +862,9 @@ def process(
     ]
     
     for step_name, step_time in steps:
-        if total_runtime > 0:
-            percentage = (step_time / total_runtime) * 100
+        if total_cumulative_time > 0:
+            percentage = (step_time / total_cumulative_time) * 100
             console.print(f"  • {step_name}: {step_time:.2f}s ({percentage:.1f}%)")
-    
-    # Show untracked time (overhead, I/O, etc.)
-    untracked_time = total_runtime - total_tracked_time
-    if total_runtime > 0 and untracked_time > 0:
-        untracked_pct = (untracked_time / total_runtime) * 100
-        console.print(f"  • Other (I/O, overhead): {untracked_time:.2f}s ({untracked_pct:.1f}%)")
     
     # Failed PDFs details
     if failed_pdfs:
@@ -869,6 +875,20 @@ def process(
             console.print(f"  ... and {len(failed_pdfs) - 10} more")
     
     console.print(f"\n[bold]Results saved to:[/bold] {scratch_dir}")
+    
+    # Stop monitoring and save results
+    console.print(f"\n[bold cyan]Stopping process monitoring and saving results...[/bold cyan]")
+    monitor.stop()
+    
+    # Save monitoring results to scratch directory
+    monitoring_metrics_path = scratch_dir / "process_monitoring_metrics.json"
+    monitoring_graph_path = scratch_dir / "process_monitoring_graph.png"
+    
+    monitor.save_metrics(monitoring_metrics_path)
+    monitor.generate_graphs(monitoring_graph_path)
+    
+    console.print(f"[green]✓[/green] Saved process monitoring metrics to: {monitoring_metrics_path}")
+    console.print(f"[green]✓[/green] Saved process monitoring graph to: {monitoring_graph_path}")
     console.print("="*70 + "\n")
 
 
