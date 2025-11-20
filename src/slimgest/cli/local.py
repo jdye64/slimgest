@@ -112,7 +112,6 @@ def make_scratch_dirs(scratch_dir: Path) -> Dict[str, Path]:
     cropped_elements_dir = scratch_dir / "cropped_elements"
     table_structure_dir = scratch_dir / "table_structure"
     graphic_elements_dir = scratch_dir / "graphic_elements"
-    table_ocr_crops_dir = scratch_dir / "table_ocr_crops"
     graphic_ocr_crops_dir = scratch_dir / "graphic_ocr_crops"
     input_pdf_dir = scratch_dir / "input_pdf"
     metrics_dir = scratch_dir / "metrics"
@@ -125,7 +124,6 @@ def make_scratch_dirs(scratch_dir: Path) -> Dict[str, Path]:
     metrics_dir.mkdir(parents=True, exist_ok=True)
     table_structure_dir.mkdir(parents=True, exist_ok=True)
     graphic_elements_dir.mkdir(parents=True, exist_ok=True)
-    table_ocr_crops_dir.mkdir(parents=True, exist_ok=True)
     graphic_ocr_crops_dir.mkdir(parents=True, exist_ok=True)
 
     return {
@@ -135,7 +133,6 @@ def make_scratch_dirs(scratch_dir: Path) -> Dict[str, Path]:
         "cropped_elements": cropped_elements_dir,
         "table_structure": table_structure_dir,
         "graphic_elements": graphic_elements_dir,
-        "table_ocr_crops": table_ocr_crops_dir,
         "graphic_ocr_crops": graphic_ocr_crops_dir,
         "input_pdf": input_pdf_dir,
         "metrics": metrics_dir,
@@ -583,27 +580,6 @@ def process_single_pdf(
                 # Increment table counter and timing
                 counters['table_count'] += 1
                 counters['time_table_structure'] += table_duration
-                
-                # Create subdirectory for this table's OCR crops
-                table_ocr_subdir = scratch["table_ocr_crops"] / f"{page_pdf_path.stem}_element_{element_index:03d}"
-                table_ocr_subdir.mkdir(parents=True, exist_ok=True)
-                
-                # Crop each detection and run OCR
-                for det_idx, detection in enumerate(table_elements):
-                    bbox = detection["bbox"]
-                    det_label = detection["label"]
-                    
-                    # Crop the detection from the table image
-                    crop_filename = f"detection_{det_idx:03d}_{det_label}.png"
-                    crop_output_path = table_ocr_subdir / crop_filename
-                    crop_detection_from_image(crop_path, bbox, crop_output_path)
-                    
-                    # Run OCR on the cropped detection
-                    ocr_text = run_nemotron_ocr(crop_output_path, local_ocr_counter)
-                    
-                    # Add OCR results to detection
-                    detection["ocr_crop_path"] = str(crop_output_path)
-                    detection["ocr_text"] = ocr_text
                 
                 # Save table structure to JSON file
                 json_filename = f"{page_pdf_path.stem}_element_{element_index:03d}_table_structure.json"
