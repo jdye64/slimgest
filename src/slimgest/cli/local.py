@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional
 
 from slimgest.cli.process.image_process import DeepseekOCRProcessor
 import typer
@@ -16,12 +16,12 @@ import os
 import re
 import time
 
-if torch.version.cuda == '11.8':
-    os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
+# if torch.version.cuda == '11.8':
+#     os.environ["TRITON_PTXAS_PATH"] = "/usr/local/cuda-11.8/bin/ptxas"
 os.environ['VLLM_USE_V1'] = '0'
 os.environ["CUDA_VISIBLE_DEVICES"] = '0'
 
-from .config import MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, MAX_CONCURRENCY, CROP_MODE, NUM_WORKERS
+from .config import MODEL_PATH, INCLUDED_MODEL_PATH, INPUT_PATH, OUTPUT_PATH, PROMPT, MAX_CONCURRENCY, CROP_MODE, NUM_WORKERS
 from concurrent.futures import ThreadPoolExecutor
 import glob
 from PIL import Image
@@ -35,8 +35,10 @@ from .process.image_process import DeepseekOCRProcessor
 ModelRegistry.register_model("DeepseekOCRForCausalLM", DeepseekOCRForCausalLM)
 
 
+_vllm_device_type = "cuda" if torch.cuda.is_available() else "cpu"
+
 llm = LLM(
-    model=MODEL_PATH,
+    model=INCLUDED_MODEL_PATH,
     hf_overrides={"architectures": ["DeepseekOCRForCausalLM"]},
     block_size=256,
     enforce_eager=False,
@@ -47,6 +49,7 @@ llm = LLM(
     max_num_seqs=MAX_CONCURRENCY,
     tensor_parallel_size=1,
     gpu_memory_utilization=0.9,
+    device=_vllm_device_type,
 )
 
 logits_processors = [NoRepeatNGramLogitsProcessor(ngram_size=40, window_size=90, whitelist_token_ids={128821, 128822})]  # window for fast；whitelist_token_ids: <td>,</td>

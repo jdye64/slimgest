@@ -10,6 +10,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+import base64
 
 
 app = typer.Typer(help="Client for slimgest REST API")
@@ -85,4 +86,50 @@ def follow(job_id: str = typer.Argument(...), server: str = typer.Option("http:/
     code = asyncio.run(_follow(server, job_id))
     raise typer.Exit(code)
 
+
+
+async def _chat_image(server: str, image_path: Path, prompt: str, model: str) -> str:
+    async with httpx.AsyncClient() as client:
+        img_bytes = image_path.read_bytes()
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+        content = []
+        if prompt:
+            content.append({"type": "text", "text": prompt})
+        content.append({"type": "image_url", "image_url": {"data": img_b64}})
+
+        payload = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": content,
+                }
+            ],
+        }
+
+        r = await client.post(f"{server.rstrip('/')}/v1/chat/completions", json=payload, timeout=60.0)
+        r.raise_for_status()
+        data = r.json()
+
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception:
+            return json.dumps(data, ensure_ascii=False)
+
+
+@app.command()
+def chat_image(
+    image: Path = typer.Argument(..., exists=True, dir_okay=False, help="Path to an image file"),
+    prompt: str = typer.Option("", help="Optional user prompt text"),
+    server: str = typer.Option("http://localhost:8000", help="Server URL"),
+    model: str = typer.Option("deepseek-ocr", help="Model name"),
+):
+    """Send an image to the OpenAI-compatible /v1/chat/completions endpoint."""
+    try:
+        content = asyncio.run(_chat_image(server, image, prompt, model))
+        console.print(content)
+    except httpx.HTTPError as e:
+        console.print(f"[red]Request failed:[/red] {e}")
+        raise typer.Exit(1)
 

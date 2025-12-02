@@ -11,7 +11,6 @@ from einops import rearrange, repeat
 from transformers import BatchFeature
 
 from vllm.config import VllmConfig
-from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.utils import set_default_torch_dtype
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -555,7 +554,7 @@ class DeepseekOCRForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        sampling_metadata: SamplingMetadata,
+        sampling_metadata,
     ) -> Optional[torch.Tensor]:
         return self.language_model.compute_logits(hidden_states,
                                                   sampling_metadata)

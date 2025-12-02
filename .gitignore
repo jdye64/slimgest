@@ -25,4 +25,6 @@ build/
 
 # Output and results
 bo20_results/
+data
+models
 

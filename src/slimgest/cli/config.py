@@ -15,6 +15,7 @@ NUM_WORKERS = 64 # image pre-process (resize/padding) workers
 PRINT_NUM_VIS_TOKENS = False
 SKIP_REPEAT = True
 MODEL_PATH = 'deepseek-ai/DeepSeek-OCR' # change to your model path
+INCLUDED_MODEL_PATH = '/app/models/deepseek-ocr'
 
 # TODO: change INPUT_PATH
 # .pdf: run_dpsk_ocr_pdf.py; 
