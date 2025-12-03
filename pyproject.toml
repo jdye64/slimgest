@@ -41,7 +41,9 @@ Homepage = "https://example.com"
 
 [project.scripts]
 slimgest = "slimgest.cli.__main__:main"
+slimgest-deepseek-local = "slimgest.cli.deepseek_local:app"
 slimgest-local = "slimgest.cli.local:app"
+world-class = "slimgest.world_class.__main__:main"
 chat-image = "slimgest.cli.client:app"
 pdf2img = "slimgest.cli.utils.pdf_utils:app"
 
