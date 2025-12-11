@@ -7,7 +7,6 @@ from queue import Queue, Empty
 from threading import Thread, Event, Lock
 from typing import Optional
 
-from rich.console import Console
 import torch
 import torch.nn.functional as F
 import pypdfium2 as pdfium
@@ -187,12 +186,9 @@ def consumer_loop_with_crops(queue: Queue, model_detector, model_crop, stop_even
     upload_stream = torch.cuda.Stream(device=device)
     compute_stream = torch.cuda.Stream(device=device)
 
-    # Preallocate scratch buffers
-    # For detector input (BATCH_SIZE,3,DET_H,DET_W)
+    # Preallocate scratch buffers (for detector; for images see below)
     det_scratch = torch.empty((BATCH_SIZE, 3, TARGET_DET_SIZE[0], TARGET_DET_SIZE[1]), dtype=torch.float32, device=device)
-    # For full-resolution images: to avoid too-large prealloc complexity we'll allocate per-batch max
-    # We'll create these lazily on first batch based on observed full H,W
-    gpu_full_images = None
+    gpu_full_images = None  # will use per-batch
 
     # Normalization tensors for detector and model_crop (if same, reuse)
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
@@ -215,162 +211,171 @@ def consumer_loop_with_crops(queue: Queue, model_detector, model_crop, stop_even
                 continue
 
         actual_b = len(cpu_batch)
-        # stack pinned CPU tensors -> requires same H,W across batch
-        # If your pages may vary size, see notes below to pad or render to fixed size.
-        cpu_stack = torch.stack(cpu_batch, dim=0)  # uint8 pinned [B,3,H_full, W_full]
+
+        # ----- Pad all pages to same H,W for batching -----
+        # Find max H and W across all images in this batch
+        heights = [img.shape[1] for img in cpu_batch]
+        widths  = [img.shape[2] for img in cpu_batch]
+        max_h = max(heights)
+        max_w = max(widths)
+
+        # Pad each image to match max_h, max_w
+        padded_cpu_batch = []
+        for img in cpu_batch:
+            c, h, w = img.shape
+            pad_h = max_h - h
+            pad_w = max_w - w
+            # Pad in (left, right, top, bottom) order for F.pad -> (w_left, w_right, h_top, h_bottom)
+            pad = (0, pad_w, 0, pad_h)
+            padded_img = F.pad(img, pad, value=0)  # Pad with zeros (black); shape [3, max_h, max_w]
+            padded_cpu_batch.append(padded_img)
+        cpu_stack = torch.stack(padded_cpu_batch, dim=0)  # [B,3,max_h,max_w], still uint8 pinned
 
         # Async H->D and create full-resolution float image on upload_stream
         with torch.cuda.stream(upload_stream):
-            gpu_uint8_full = cpu_stack.to(device, non_blocking=True)          # [B,3,Hf,Wf] uint8
-            gpu_full = gpu_uint8_full.float().div_(255.0)                     # float 0..1
-            # Optionally keep gpu_full for later cropping; do not resize it here
-            # We'll also prepare detector input by resizing gpu_full -> DET size
+            gpu_uint8_full = cpu_stack.to(device, non_blocking=True)          # [B,3,max_h,max_w] uint8
+            gpu_full = gpu_uint8_full.float().div_(255.0)                     # float 0..1 (kept for cropping later)
+
+            # Detector input: resize batch to detector target size
             gpu_det_in = F.interpolate(gpu_full, size=TARGET_DET_SIZE, mode='bilinear', align_corners=False)
-            # normalize detector input
             gpu_det_in = (gpu_det_in - mean) / std
+
             # copy into det_scratch first actual_b slots to reuse buffer
             det_scratch[:actual_b].copy_(gpu_det_in)
-            # record event to signal compute stream
             upload_event = torch.cuda.Event()
             upload_event.record()
 
-        # Compute stream: run detector on resized inputs
         with torch.cuda.stream(compute_stream):
             compute_stream.wait_event(upload_event)
             detector_input = det_scratch[:actual_b]  # [B,3,DET_H,DET_W]
 
+            # Prepare original sizes for the detector model
+            orig_sizes = [[heights[i], widths[i]] for i in range(actual_b)]
+
             # model_detector should be on device and set to eval()
             with torch.no_grad():
-                # It's common for detectors to return per-image lists of boxes; adapt below
-                det_out = model_detector(detector_input)  # user-specific interface
+                det_out = model_detector(detector_input, orig_sizes)  # user-specific interface
 
-            # Normalize understanding of detector output:
-            # We expect det_out to be either:
-            #  - a list of length B with each element a tensor [K,4] of boxes in pixel coords (relative to DET size)
-            #  - a tensor [B, K, 4]
-            #  - a tensor [total_boxes, 6] with (img_idx, x1, y1, x2, y2, score) (less common)
-            # We'll convert to a consolidated boxes_all tensor: [N,5] with (img_idx, x1, y1, x2, y2) in full-image pixel coords.
-
-            # --- NORMALIZE detector outputs into boxes_all ---
-            boxes_list = []  # will collect tensors on device
+            # ---- NORMALIZE detector outputs into boxes_all ----
+            boxes_list = []
             if isinstance(det_out, (list, tuple)):
-                # list of per-image boxes or dicts as in some libs
                 for i in range(actual_b):
                     bi = det_out[i]
-                    # if dict like {'boxes': tensor, 'scores':..., ...}
                     if isinstance(bi, dict) and 'boxes' in bi:
                         bi = bi['boxes']
-                    if bi is None:
+                    if bi is None or bi.numel() == 0:
                         continue
-                    if bi.numel() == 0:
-                        continue
-                    # bi expected [K,4] in pixel coords relative to DET input
-                    # Map from DET coords to full image coords:
-                    # full_x = x * (W_full / DET_W)
-                    _, Hf, Wf = gpu_full.shape  # careful: gpu_full shape is [B,3,Hf,Wf]; but that's per-batch, we stacked, so...
-                    # Actually gpu_full has shape [actual_b,3,Hf,Wf]; we need per-image Hf,Wf; assume all same Hf,Wf
-                    _, Hf, Wf = gpu_full.shape[1], gpu_full.shape[2], gpu_full.shape[3] if False else (gpu_full.shape[1], gpu_full.shape[2], gpu_full.shape[3])
-                    # Simpler: get Hf,Wf from gpu_full (it is [B,C,Hf,Wf])
-                    Hf = gpu_full.shape[2]
-                    Wf = gpu_full.shape[3]
-
-                    # DET_W, DET_H
+                    # Use this image's *unpadded* height/width to map detector boxes to full res
+                    this_h = heights[i]
+                    this_w = widths[i]
+                    # The detector sees the page at TARGET_DET_SIZE (DET_H, DET_W)
                     DET_H, DET_W = TARGET_DET_SIZE
-                    # Convert pixel coords
-                    # If boxes appear normalized (max <= 1) treat as normalized
+                    # Boxes may be normalized [0,1] or pixel in DET dims
                     if bi.max() <= 1.0001:
-                        # normalized coords [0,1] -> convert to DET pixel coords
                         bi_px = bi * torch.tensor([DET_W, DET_H, DET_W, DET_H], device=bi.device)
                     else:
                         bi_px = bi
-
-                    # scale to full resolution
-                    scale_x = Wf / DET_W
-                    scale_y = Hf / DET_H
+                    # Scale to *unpadded* size of this page (original page, before batch padding)
+                    scale_x = this_w / DET_W
+                    scale_y = this_h / DET_H
                     x1 = bi_px[:, 0] * scale_x
                     y1 = bi_px[:, 1] * scale_y
                     x2 = bi_px[:, 2] * scale_x
                     y2 = bi_px[:, 3] * scale_y
-
+                    # If boxes go beyond the original image (possible due to detector quirks), clamp them here
+                    x1 = x1.clamp(0, this_w-1)
+                    x2 = x2.clamp(0, this_w-1)
+                    y1 = y1.clamp(0, this_h-1)
+                    y2 = y2.clamp(0, this_h-1)
                     img_idx = torch.full((x1.shape[0], 1), i, device=bi.device)
-                    boxes_img = torch.stack((img_idx[:,0], x1, y1, x2, y2), dim=1)  # [K,5]
+                    boxes_img = torch.stack((img_idx[:,0], x1, y1, x2, y2), dim=1)
                     boxes_list.append(boxes_img)
 
             elif isinstance(det_out, torch.Tensor):
-                # Could be [B,K,4] or [N,5] etc.
+                # Could be [B,K,4], or [N,5], etc.
                 if det_out.ndim == 3 and det_out.shape[0] == actual_b:
-                    # [B,K,4]
-                    B0, K, _ = det_out.shape
-                    for i in range(B0):
-                        bi = det_out[i]  # [K,4]
-                        if bi.numel() == 0:
+                    for i in range(actual_b):
+                        bi = det_out[i]
+                        if bi is None or bi.numel() == 0:
                             continue
-                        # handle normalized vs pixel like above
+                        this_h = heights[i]
+                        this_w = widths[i]
+                        DET_H, DET_W = TARGET_DET_SIZE
                         if bi.max() <= 1.0001:
-                            bi_px = bi * torch.tensor([TARGET_DET_SIZE[1], TARGET_DET_SIZE[0],
-                                                       TARGET_DET_SIZE[1], TARGET_DET_SIZE[0]], device=bi.device)
+                            bi_px = bi * torch.tensor([DET_W, DET_H, DET_W, DET_H], device=bi.device)
                         else:
                             bi_px = bi
-                        Hf = gpu_full.shape[2]
-                        Wf = gpu_full.shape[3]
-                        scale_x = Wf / TARGET_DET_SIZE[1]
-                        scale_y = Hf / TARGET_DET_SIZE[0]
+                        scale_x = this_w / DET_W
+                        scale_y = this_h / DET_H
                         x1 = bi_px[:, 0] * scale_x
                         y1 = bi_px[:, 1] * scale_y
                         x2 = bi_px[:, 2] * scale_x
                         y2 = bi_px[:, 3] * scale_y
+                        x1 = x1.clamp(0, this_w-1)
+                        x2 = x2.clamp(0, this_w-1)
+                        y1 = y1.clamp(0, this_h-1)
+                        y2 = y2.clamp(0, this_h-1)
                         img_idx = torch.full((x1.shape[0], 1), i, device=bi.device)
                         boxes_img = torch.stack((img_idx[:,0], x1, y1, x2, y2), dim=1)
                         boxes_list.append(boxes_img)
                 else:
-                    # assume already [N,5] (img_idx, x1,y1,x2,y2)
+                    # assume already [N,5]
                     boxes_list.append(det_out)
 
             else:
                 log("Unhandled detector output type:", type(det_out))
 
             if len(boxes_list) == 0:
-                # no detections in this batch -> continue
                 total_pages += actual_b
                 continue
 
             boxes_all = torch.cat(boxes_list, dim=0).to(device)
 
-            # Clip boxes to image bounds
-            boxes_all[:, 1].clamp_(0, gpu_full.shape[3] - 1)  # x1
-            boxes_all[:, 3].clamp_(0, gpu_full.shape[3] - 1)  # x2
-            boxes_all[:, 2].clamp_(0, gpu_full.shape[2] - 1)  # y1
-            boxes_all[:, 4].clamp_(0, gpu_full.shape[2] - 1)  # y2
+            # Now, full_images = gpu_full = padded [B,3,max_h,max_w]
+            # Before cropping, we need to make sure cropping reads only the original pixels (not padded),
+            # so we must also adjust the boxes to pad coordinates
+            # However, since all images are now [max_h,max_w] with bottom/right padding,
+            # and boxes are generated for the original pixels, this is safe for grid_sample, since
+            # boxes outside the original region will sample from zero.
+
+            # We must, however, filter boxes that are effectively entirely in the padded region
+            # (i.e. degenerate boxes), and clamp boxes to original region
+            for i in range(actual_b):
+                # Clamp boxes for each image to that page's coverage only
+                mask = boxes_all[:,0]==i
+                if mask.any():
+                    boxes_i = boxes_all[mask]
+                    boxes_i[:,1] = boxes_i[:,1].clamp(0, widths[i]-1)
+                    boxes_i[:,3] = boxes_i[:,3].clamp(0, widths[i]-1)
+                    boxes_i[:,2] = boxes_i[:,2].clamp(0, heights[i]-1)
+                    boxes_i[:,4] = boxes_i[:,4].clamp(0, heights[i]-1)
+                    boxes_all[mask] = boxes_i
 
             # Remove degenerate boxes where x2<=x1 or y2<=y1
-            widths = boxes_all[:, 3] - boxes_all[:, 1]
-            heights = boxes_all[:, 4] - boxes_all[:, 2]
-            valid_mask = (widths > 1.0) & (heights > 1.0)
+            widths_box = boxes_all[:, 3] - boxes_all[:, 1]
+            heights_box = boxes_all[:, 4] - boxes_all[:, 2]
+            valid_mask = (widths_box > 1.0) & (heights_box > 1.0)
             boxes_all = boxes_all[valid_mask]
             if boxes_all.numel() == 0:
                 total_pages += actual_b
                 continue
 
-            # Crop full-resolution images using grid_sample in a vectorized way
-            # We need full_images tensor [B,3,Hf,Wf] on device (gpu_full)
-            # gpu_full currently is [B,3,Hf,Wf] in upload_stream - but we are on compute_stream and waited on the upload_event,
-            # so gpu_full is available here. Ensure it's named correctly:
-            full_images = gpu_full  # [B,3,Hf,Wf] float 0..1
-
+            # Crop from *padded* images using batch_crop_from_boxes
+            # batch_crop_from_boxes expects full_images [B,3,H,W] and coordinates in unpadded region,
+            # but since extra pixels are black, out-of-original will sample as black.
+            full_images = gpu_full
             crops = batch_crop_from_boxes(full_images, boxes_all, TARGET_CROP_SIZE)  # [N,3,CH,CW]
 
-            # Normalize crops (in-place)
-            crops = (crops - mean) / std  # broadcasting works
+            crops = (crops - mean) / std
 
-            # Run model_crop on the crops (batched)
+            # Run model_crop on crops
+            # Each crop is TARGET_CROP_SIZE, so provide those as original sizes
+            num_crops = crops.shape[0]
+            crop_orig_sizes = [[TARGET_CROP_SIZE[0], TARGET_CROP_SIZE[1]]] * num_crops
             with torch.no_grad():
-                out_crops = model_crop(crops) if model_crop is not None else None
+                out_crops = model_crop(crops, crop_orig_sizes) if model_crop is not None else None
 
-            # optional: store or push outputs to some sink
-            # For example, map boxes_all + out_crops to CPU results (but avoid unless needed)
-            # out_cpu = None
-            # if out_crops is not None:
-            #     out_cpu = out_crops.detach().cpu()  # avoid unless necessary
+            # Optionally: output or store as before
 
         total_pages += actual_b
 
@@ -394,7 +399,6 @@ def run_pdf_pipeline_with_crops(pdf_paths, model_detector, model_crop):
 
 
 app = typer.Typer(help="Process PDFs locally using shared pipeline")
-console = Console()
 
 @app.command()
 def run(
@@ -403,17 +407,13 @@ def run(
     import torch
     import torch.nn as nn
 
-    # dummy model for benchmarking (make sure it's on the same device)
-    dummy_model = nn.Sequential(
-        nn.Conv2d(3, 64, kernel_size=3, padding=1),
-        nn.ReLU(),
-        nn.AdaptiveAvgPool2d((1,1)),
-        nn.Flatten(),
-        nn.Linear(64, 128)
-    ).to("cuda:0").eval()
+    from nemotron_page_elements_v3.model import define_model
+
+    # Load Page Elements model
+    page_elements_model = define_model("page_element_v3")
 
     pdf_files = [
         str(f) for f in input_dir.iterdir()
         if f.is_file() and f.suffix.lower() == ".pdf"
     ]
-    run_pdf_pipeline_with_crops(pdf_files, model_detector=dummy_model, model_crop=dummy_model)
+    run_pdf_pipeline_with_crops(pdf_files, model_detector=page_elements_model, model_crop=page_elements_model)
