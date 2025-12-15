@@ -27,6 +27,7 @@ dependencies = [
   "tqdm>=4.67.1",
   "transformers>=4.49.0",
   "tokenizers>=0.20.3",
+  "pikepdf",
   "PyMuPDF",
   "img2pdf",
   "einops",
@@ -40,12 +41,7 @@ dependencies = [
 Homepage = "https://example.com"
 
 [project.scripts]
-slimgest = "slimgest.cli.__main__:main"
-slimgest-deepseek-local = "slimgest.cli.deepseek_local:app"
-slimgest-local = "slimgest.cli.local:app"
-world-class = "slimgest.world_class.__main__:main"
-chat-image = "slimgest.cli.client:app"
-pdf2img = "slimgest.cli.utils.pdf_utils:app"
+slimgest = "slimgest.__main__:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
