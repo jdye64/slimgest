@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 from rich.console import Console
 from rich.traceback import install
 from torch import nn
@@ -11,7 +11,9 @@ from nemotron_page_elements_v3.model import define_model as define_model_page_el
 from nemotron_page_elements_v3.model import resize_pad as resize_pad_page_elements
 from nemotron_page_elements_v3.utils import postprocess_preds_page_element as postprocess_preds_page_element
 from nemotron_table_structure_v1.model import define_model as define_model_table_structure
+from nemotron_table_structure_v1.model import resize_pad as resize_pad_table_structure
 from nemotron_graphic_elements_v1.model import define_model as define_model_graphic_elements
+from nemotron_graphic_elements_v1.model import resize_pad as resize_pad_graphic_elements
 from nemotron_ocr.inference.pipeline import NemotronOCR
 
 import typer
@@ -20,29 +22,54 @@ app = typer.Typer(help="Simpliest pipeline with limited CPU parallelism while us
 install(show_locals=False)
 console = Console()
 
-def crop_tensor_on_gpu(image_tensor: torch.Tensor, bbox: List[int]) -> torch.Tensor:
+def crop_tensor_on_gpu(image_tensor: torch.Tensor, bbox: List[int], bitmap_shape: Tuple[int, int], page_elements_input_shape: Tuple[int, int]) -> torch.Tensor:
     """
     Crops a tensor image on the GPU using the given bounding box.
+    The bbox is in normalized coordinates (0-1) relative to the original bitmap.
+    The image_tensor has been resized/padded to page_elements_input_shape, so we transform
+    the bbox coordinates to match the resized tensor space.
 
     Args:
-        image_tensor (torch.Tensor): Image tensor of shape [C, H, W] on GPU.
-        bbox (List[int] or torch.Tensor): Bounding box [xmin, ymin, xmax, ymax].
+        image_tensor (torch.Tensor): Resized image tensor of shape [C, H, W] on GPU.
+        bbox (np.ndarray): Normalized bounding box [xmin, ymin, xmax, ymax] in range [0, 1].
+        bitmap_shape (Tuple[int, int]): Original bitmap shape (height, width) before resize.
+        page_elements_input_shape (Tuple[int, int]): Target shape (height, width) the image was resized to.
 
     Returns:
         torch.Tensor: Cropped image tensor [C, cropped_H, cropped_W] on the same device.
     """
-    # Ensure bbox is in integer format and tensor if needed
-    if not torch.is_tensor(bbox):
-        bbox = torch.tensor(bbox, dtype=torch.long, device=image_tensor.device)
-    else:
-        bbox = bbox.to(dtype=torch.long, device=image_tensor.device)
-    xmin, ymin, xmax, ymax = bbox.tolist()
-    # Clamp the bounds in case they exceed image size
+
+    # Get dimensions
+    orig_h, orig_w = bitmap_shape
+    input_h, input_w = page_elements_input_shape
+    
+    # Calculate scale and padding (matching resize_pad_page_elements logic)
+    scale = min(input_h / orig_h, input_w / orig_w)
+    scaled_h = int(orig_h * scale)
+    scaled_w = int(orig_w * scale)
+    pad_y = (input_h - scaled_h) / 2
+    pad_x = (input_w - scaled_w) / 2
+    
+    # Convert normalized bbox to pixel coordinates in original image
+    boxes_plot = bbox.copy()
+    boxes_plot[0] *= orig_w  # xmin
+    boxes_plot[2] *= orig_w  # xmax
+    boxes_plot[1] *= orig_h  # ymin
+    boxes_plot[3] *= orig_h  # ymax
+    
+    # Scale to resized coordinates and add padding offset
+    xmin = int(boxes_plot[0] * scale + pad_x)
+    ymin = int(boxes_plot[1] * scale + pad_y)
+    xmax = int(boxes_plot[2] * scale + pad_x)
+    ymax = int(boxes_plot[3] * scale + pad_y)
+    
+    # Clamp the bounds to the actual tensor dimensions
     _, H, W = image_tensor.shape
-    xmin = max(0, xmin)
-    ymin = max(0, ymin)
-    xmax = min(W, xmax)
-    ymax = min(H, ymax)
+    xmin = max(0, min(xmin, W - 1))
+    ymin = max(0, min(ymin, H - 1))
+    xmax = max(xmin + 1, min(xmax, W))  # Ensure xmax > xmin
+    ymax = max(ymin + 1, min(ymax, H))  # Ensure ymax > ymin
+    
     cropped = image_tensor[:, ymin:ymax, xmin:xmax]
     return cropped
 
@@ -67,28 +94,41 @@ def pdf_to_page_tensors(pdf_path, page_elements_model, table_structure_model, gr
         tensor = torch.from_numpy(arr).permute(2,0,1).contiguous()
         tensor = tensor.to(device, non_blocking=True)
 
+        cloned_tensor = tensor.clone()
+
+        page_elements_input_shape = (1024, 1024)
+        table_structure_input_shape = (1024, 1024)
+        graphic_elements_input_shape = (1024, 1024)
+
         with torch.inference_mode():
-            tensor = resize_pad_page_elements(tensor, (1024, 1024))
+            tensor = resize_pad_page_elements(tensor, page_elements_input_shape)
             preds = page_elements_model(tensor, bitmap_shape)[0]
             boxes, labels, scores = postprocess_preds_page_element(preds, page_elements_model.thresholds_per_class, page_elements_model.labels)
 
             # Iterate over all of the labels and crop the tensors that are tables
             for label, box in zip(labels, boxes):
                 if label == 0: # table from page_elements_model.labels
-                    cropped = crop_tensor_on_gpu(tensor, box)
-                    # Run the table structure model on the table tensors
-                    # Get the shape of the cropped tensor (H, W)
+                    cropped = crop_tensor_on_gpu(tensor, box, bitmap_shape, page_elements_input_shape).clone()
+                    # Get the shape of the cropped tensor BEFORE resizing (H, W)
                     crop_shape = (cropped.shape[1], cropped.shape[2])
-                    preds = table_structure_model(cropped, crop_shape)[0]
+                    # Resize the cropped tensor to the expected input size (1024, 1024)
+                    cropped_resized = resize_pad_table_structure(cropped, table_structure_input_shape)
+                    # Run the table structure model on the resized cropped tensor
+                    preds = table_structure_model(cropped_resized, crop_shape)[0]
+                    print(f"Table structure results: {preds}")
                 elif label == 1 or label == 2 or label == 3:
-                    cropped = crop_tensor_on_gpu(tensor, box)
-                    # Run the graphic elements model on the cropped tensors
-                    # Get the shape of the cropped tensor (H, W)
+                    cropped = crop_tensor_on_gpu(tensor, box, bitmap_shape, page_elements_input_shape).clone()
+                    # Get the shape of the cropped tensor BEFORE resizing (H, W)
                     crop_shape = (cropped.shape[1], cropped.shape[2])
-                    preds = graphic_element_model(cropped, crop_shape)[0]
+                    # Resize the cropped tensor to the expected input size (1024, 1024)
+                    cropped_resized = resize_pad_graphic_elements(cropped, graphic_elements_input_shape)
+                    # Run the graphic elements model on the resized cropped tensor
+                    preds = graphic_element_model(cropped_resized, crop_shape)[0]
+                    print(f"Graphic elements results: {preds}")
 
-            # # Send the tensor to the OCR model
-            # preds = ocr_model(tensor)
+            # Send the tensor to the OCR model
+            preds = ocr_model(cloned_tensor)
+            print(f"OCR results: {preds}")
 
         result.append(tensor)
         page.close()
