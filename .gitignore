@@ -28,3 +28,5 @@ bo20_results/
 data
 models
 
+# Ignore private directory
+private/

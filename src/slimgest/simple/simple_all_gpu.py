@@ -1,11 +1,12 @@
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from rich.console import Console
 from rich.traceback import install
 from torch import nn
 import torch
 import time
 import pypdfium2 as pdfium
+import json
 
 from nemotron_page_elements_v3.model import define_model as define_model_page_elements
 from nemotron_page_elements_v3.model import resize_pad as resize_pad_page_elements
@@ -80,7 +81,9 @@ def pdf_to_page_tensors(pdf_path, page_elements_model, table_structure_model, gr
     """
     pdf = pdfium.PdfDocument(pdf_path)
     num_pages = len(pdf)
+    tensors = []
     result = []
+    raw_results = []
     for idx in range(num_pages):
         page = pdf.get_page(idx)
         # Render at 150 DPI, RGB
@@ -94,53 +97,65 @@ def pdf_to_page_tensors(pdf_path, page_elements_model, table_structure_model, gr
         tensor = torch.from_numpy(arr).permute(2,0,1).contiguous()
         tensor = tensor.to(device, non_blocking=True)
 
-        cloned_tensor = tensor.clone()
+        # cloned_tensor = tensor.clone()
+        cloned_tensor = tensor
 
         page_elements_input_shape = (1024, 1024)
         table_structure_input_shape = (1024, 1024)
         graphic_elements_input_shape = (1024, 1024)
 
         with torch.inference_mode():
-            tensor = resize_pad_page_elements(tensor, page_elements_input_shape)
-            preds = page_elements_model(tensor, bitmap_shape)[0]
-            boxes, labels, scores = postprocess_preds_page_element(preds, page_elements_model.thresholds_per_class, page_elements_model.labels)
+            # tensor = resize_pad_page_elements(tensor, page_elements_input_shape)
+            # preds = page_elements_model(tensor, bitmap_shape)[0]
+            # boxes, labels, scores = postprocess_preds_page_element(preds, page_elements_model.thresholds_per_class, page_elements_model.labels)
 
-            # Iterate over all of the labels and crop the tensors that are tables
-            for label, box in zip(labels, boxes):
-                if label == 0: # table from page_elements_model.labels
-                    cropped = crop_tensor_on_gpu(tensor, box, bitmap_shape, page_elements_input_shape).clone()
-                    # Get the shape of the cropped tensor BEFORE resizing (H, W)
-                    crop_shape = (cropped.shape[1], cropped.shape[2])
-                    # Resize the cropped tensor to the expected input size (1024, 1024)
-                    cropped_resized = resize_pad_table_structure(cropped, table_structure_input_shape)
-                    # Run the table structure model on the resized cropped tensor
-                    preds = table_structure_model(cropped_resized, crop_shape)[0]
-                    print(f"Table structure results: {preds}")
-                elif label == 1 or label == 2 or label == 3:
-                    cropped = crop_tensor_on_gpu(tensor, box, bitmap_shape, page_elements_input_shape).clone()
-                    # Get the shape of the cropped tensor BEFORE resizing (H, W)
-                    crop_shape = (cropped.shape[1], cropped.shape[2])
-                    # Resize the cropped tensor to the expected input size (1024, 1024)
-                    cropped_resized = resize_pad_graphic_elements(cropped, graphic_elements_input_shape)
-                    # Run the graphic elements model on the resized cropped tensor
-                    preds = graphic_element_model(cropped_resized, crop_shape)[0]
-                    print(f"Graphic elements results: {preds}")
+            # # Iterate over all of the labels and crop the tensors that are tables
+            # for label, box in zip(labels, boxes):
+            #     if label == 0: # table from page_elements_model.labels
+            #         cropped = crop_tensor_on_gpu(tensor, box, bitmap_shape, page_elements_input_shape).clone()
+            #         # Get the shape of the cropped tensor BEFORE resizing (H, W)
+            #         crop_shape = (cropped.shape[1], cropped.shape[2])
+            #         # Resize the cropped tensor to the expected input size (1024, 1024)
+            #         cropped_resized = resize_pad_table_structure(cropped, table_structure_input_shape)
+            #         # Run the table structure model on the resized cropped tensor
+            #         preds = table_structure_model(cropped_resized, crop_shape)[0]
+            #         print(f"Table structure results: {preds}")
+            #     elif label == 1 or label == 2 or label == 3:
+            #         cropped = crop_tensor_on_gpu(tensor, box, bitmap_shape, page_elements_input_shape).clone()
+            #         # Get the shape of the cropped tensor BEFORE resizing (H, W)
+            #         crop_shape = (cropped.shape[1], cropped.shape[2])
+            #         # Resize the cropped tensor to the expected input size (1024, 1024)
+            #         cropped_resized = resize_pad_graphic_elements(cropped, graphic_elements_input_shape)
+            #         # Run the graphic elements model on the resized cropped tensor
+            #         preds = graphic_element_model(cropped_resized, crop_shape)[0]
+            #         print(f"Graphic elements results: {preds}")
 
             # Send the tensor to the OCR model
             preds = ocr_model(cloned_tensor)
-            print(f"OCR results: {preds}")
 
-        result.append(tensor)
+            for pred in preds:
+                result.append(str(pred['text']))
+                raw_results.append(str(pred))
+
+        tensors.append(tensor)
         page.close()
     pdf.close()
-    return result
+    return tensors, result, raw_results
 
-def run_pipeline(pdf_files: List[str],
+def run_pipeline(
+    pdf_files: List[str],
     page_elements_model: nn.Module,
     table_structure_model: nn.Module,
     graphic_elements_model: nn.Module,
     ocr_model: NemotronOCR,
+    raw_output_dir: Optional[Path] = None,
 ):
+    """
+    Args:
+        pdf_files: List of PDF file paths as strings.
+        page_elements_model, table_structure_model, graphic_elements_model, ocr_model: Models to use.
+        raw_output_dir: Directory to save raw OCR results. If None, does not save.
+    """
 
     gpu_tensors = []
     idx = 1
@@ -151,7 +166,9 @@ def run_pipeline(pdf_files: List[str],
         console.print(f"[bold cyan]Processing:[/bold cyan] {pdf_path}")
 
         # Efficiently load all pages to GPU tensors (list of [3,H,W] uint8 cuda tensors)
-        page_tensors = pdf_to_page_tensors(pdf_path, page_elements_model, table_structure_model, graphic_elements_model, ocr_model)
+        page_tensors, page_ocr_results, page_raw_ocr_results = pdf_to_page_tensors(
+            pdf_path, page_elements_model, table_structure_model, graphic_elements_model, ocr_model
+        )
         # gpu_tensors.extend(page_tensors)
         num_pages = len(page_tensors)
         total_pages_loaded += num_pages
@@ -164,6 +181,17 @@ def run_pipeline(pdf_files: List[str],
             f"Current Runtime: {time.time() - start_time:.2f} seconds"
         )
         idx += 1
+        ocr_final_result = " ".join(page_ocr_results)
+        console.print(f"OCR final result: {ocr_final_result}", markup=False)
+
+        if raw_output_dir is not None:
+            raw_output_dir = Path(raw_output_dir)
+            raw_output_dir.mkdir(parents=True, exist_ok=True)
+            pdf_path_obj = Path(pdf_path)
+            output_json_path = raw_output_dir / pdf_path_obj.with_suffix('.page_raw_ocr_results.json').name
+            with open(output_json_path, "w", encoding="utf-8") as f:
+                json.dump(page_raw_ocr_results, f, ensure_ascii=False, indent=2)
+            console.print(f"Saved page_raw_ocr_results to {output_json_path}")
 
     elapsed = time.time() - start_time
     console.print(f"[bold green]Loaded {len(gpu_tensors)} pages from {pdf_files} in {elapsed:.2f} seconds[/bold green]")
@@ -172,7 +200,8 @@ def run_pipeline(pdf_files: List[str],
 
 @app.command()
 def run(
-    input_dir: Path = typer.Argument(..., exists=True, file_okay=False),
+    input_dir: Path = typer.Argument(..., exists=True, file_okay=True),
+    raw_output_dir: Optional[Path] = typer.Option(None, help="Directory to save raw OCR results (optional)."),
 ):
     # Load Page Elements model
     page_elements_model = define_model_page_elements("page_element_v3")
@@ -180,10 +209,14 @@ def run(
     graphic_elements_model = define_model_graphic_elements("graphic_elements_v1")
     ocr_model = NemotronOCR(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints")
 
-    pdf_files = [
-        str(f) for f in input_dir.iterdir()
-        if f.is_file() and f.suffix.lower() == ".pdf"
-    ]
+    
+    if input_dir.is_file():
+        pdf_files = [input_dir]
+    else:
+        pdf_files = [
+            str(f) for f in input_dir.iterdir()
+            if f.is_file() and f.suffix.lower() == ".pdf"
+        ]
 
     console.print(f"Processing {len(pdf_files)} PDFs")
     console.print(f"Using page_elements_model device: {page_elements_model.device}")
@@ -197,6 +230,13 @@ def run(
         time.sleep(1)
     console.print("[bold green]Go![/bold green]")
 
-    run_pipeline(pdf_files, page_elements_model, table_structure_model, graphic_elements_model, ocr_model)
+    run_pipeline(
+        pdf_files,
+        page_elements_model,
+        table_structure_model,
+        graphic_elements_model,
+        ocr_model,
+        raw_output_dir=raw_output_dir,
+    )
 
     console.print("[bold green]Done![/bold green]")
