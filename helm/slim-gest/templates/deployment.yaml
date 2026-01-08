@@ -40,9 +40,6 @@ spec:
         - name: http
           containerPort: {{ .Values.app.port }}
           protocol: TCP
-        env:
-        - name: NEMOTRON_OCR_MODEL_DIR
-          value: "{{ .Values.app.modelDir }}"
         {{- if .Values.livenessProbe.enabled }}
         livenessProbe:
           httpGet:
@@ -65,38 +62,6 @@ spec:
         {{- end }}
         resources:
           {{- toYaml .Values.resources | nindent 12 }}
-        volumeMounts:
-        - name: models
-          mountPath: {{ .Values.volumes.models.mountPath }}
-          readOnly: true
-        {{- if .Values.volumes.data.enabled }}
-        - name: data
-          mountPath: {{ .Values.volumes.data.mountPath }}
-        {{- end }}
-        {{- with .Values.extraVolumeMounts }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
-      volumes:
-      - name: models
-        {{- if eq .Values.volumes.models.type "hostPath" }}
-        hostPath:
-          path: {{ .Values.volumes.models.hostPath.path }}
-          type: {{ .Values.volumes.models.hostPath.type }}
-        {{- else if eq .Values.volumes.models.type "persistentVolumeClaim" }}
-        persistentVolumeClaim:
-          claimName: {{ .Values.volumes.models.persistentVolumeClaim.claimName }}
-        {{- end }}
-      {{- if .Values.volumes.data.enabled }}
-      - name: data
-        {{- if eq .Values.volumes.data.type "hostPath" }}
-        hostPath:
-          path: {{ .Values.volumes.data.hostPath.path }}
-          type: {{ .Values.volumes.data.hostPath.type }}
-        {{- end }}
-      {{- end }}
-      {{- with .Values.extraVolumes }}
-      {{- toYaml . | nindent 6 }}
-      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
