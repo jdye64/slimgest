@@ -40,13 +40,18 @@ COPY models/nemotron-ocr-v1/checkpoints /app/models/nemotron-ocr-v1/checkpoints
 RUN /root/.local/bin/uv venv /opt/venv --python python3.12
 ENV PATH="/opt/venv/bin:${PATH}"
 
+# First install torch so we can more directly control the version and CUDA version
+RUN /root/.local/bin/uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+
 # Install nemotron-ocr wheel first
 RUN /root/.local/bin/uv pip install /tmp/nemotron_ocr-1.0.0-py3-none-any.whl \
   --index-url https://download.pytorch.org/whl/cu128 \
   --extra-index-url https://pypi.org/simple
 
 # Install project dependencies with UV pip
-RUN /root/.local/bin/uv pip install .
+RUN /root/.local/bin/uv pip install . \
+  --index-url https://download.pytorch.org/whl/cu128 \
+  --extra-index-url https://pypi.org/simple
 
 # Set model paths environment variable
 ENV NEMOTRON_OCR_MODEL_DIR=/app/models/nemotron-ocr-v1/checkpoints
