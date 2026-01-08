@@ -5,7 +5,7 @@
 replicaCount: 1
 
 image:
-  repository: "nvcr.io/nvidia/nemo-microservices/nv-ingest"
+  repository: "nvcr.io/nvstaging/nim/nv-ingest"
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
   tag: "slim-26.3.0-001"
