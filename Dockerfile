@@ -41,7 +41,9 @@ RUN /root/.local/bin/uv venv /opt/venv --python python3.12
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # Install nemotron-ocr wheel first
-RUN /root/.local/bin/uv pip install /tmp/nemotron_ocr-1.0.0-py3-none-any.whl
+RUN /root/.local/bin/uv pip install /tmp/nemotron_ocr-1.0.0-py3-none-any.whl \
+  --index-url https://download.pytorch.org/whl/cu128 \
+  --extra-index-url https://pypi.org/simple
 
 # Install project dependencies with UV pip
 RUN /root/.local/bin/uv pip install .
