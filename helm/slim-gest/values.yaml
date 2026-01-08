@@ -123,3 +123,29 @@ affinity: {}
   #         operator: In
   #         values:
   #         - nvidia-gpu
+
+
+## @param ngcApiSecret.create Specifies whether to create the ngc api secret
+## @param ngcApiSecret.password The password to use for the NGC Secret
+ngcApiSecret:
+  # If set to false, the chart expects a secret with name ngc-api to exist in the namespace
+  # credentials are needed.
+  create: false
+  password: ""
+
+## @param ngcImagePullSecret.create Specifies whether to create the NVCR Image Pull secret
+## @param ngcImagePullSecret.password The password to use for the NVCR Image Pull Secret
+## @param ngcImagePullSecret.registry [default: "nvcr.io"] The registry URL
+## @param ngcImagePullSecret.name [default: "ngcImagePullSecret"] The name of the secret
+## @param ngcImagePullSecret.username [default: "$oauthtoken"] The username for the registry
+ngcImagePullSecret:
+  create: false
+  # Leave blank, if no imagePullSecret is needed.
+  registry: "nvcr.io"
+  name: "ngcImagePullSecret"
+  # If set to false, the chart expects either a imagePullSecret
+  # with the name configured above to be present on the cluster or that no
+  # credentials are needed.
+
+  username: '$oauthtoken'
+  password: ""

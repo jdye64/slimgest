@@ -60,3 +60,18 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+
+{{/*
+Create secret to access docker registry
+*/}}
+{{- define "slim-gest.ngcImagePullSecret" }}
+{{- printf "{\"auths\": {\"%s\": {\"auth\": \"%s\"}}}" .Values.ngcImagePullSecret.registry (printf "%s:%s" .Values.ngcImagePullSecret.username .Values.ngcImagePullSecret.password | b64enc) | b64enc }}
+{{- end }}
+
+{{/*
+  Create secret to access NGC Api
+  */}}
+  {{- define "slim-gest.ngcApiSecret" }}
+  {{- printf "%s" .Values.ngcApiSecret.password  }}
+  {{- end }}
