@@ -8,7 +8,7 @@ image:
   repository: "nvcr.io/nvstaging/nim/nv-ingest"
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
-  tag: "slim-26.3.0-006"
+  tag: "slim-26.3.0-007"
 
 imagePullSecrets: []
 nameOverride: ""
