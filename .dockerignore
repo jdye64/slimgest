@@ -1,6 +1,11 @@
 # Exclude large model and data directories
 data/
-models/
+models/*
+# But include the nemotron-ocr wheel file
+!models/nemotron-ocr-v1/
+!models/nemotron-ocr-v1/nemotron-ocr/
+!models/nemotron-ocr-v1/nemotron-ocr/dist/
+!models/nemotron-ocr-v1/nemotron-ocr/dist/nemotron_ocr-1.0.0-py3-none-any.whl
 
 # Python cache
 __pycache__/

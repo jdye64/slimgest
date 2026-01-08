@@ -35,6 +35,9 @@ dependencies = [
   "addict",
   "Pillow",
   "numpy",
+  "nemotron-page-elements-v3==3.0.1",
+  "nemotron-graphic-elements-v1==1.0.0",
+  "nemotron-table-structure-v1==1.0.0",
 ]
 
 [project.urls]

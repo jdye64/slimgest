@@ -17,8 +17,9 @@ RUN apt-get update && \
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
-# Install pip for python3.12
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12
+# Install UV for fast package installation
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 
@@ -26,17 +27,24 @@ WORKDIR /app
 COPY pyproject.toml README.md /app/
 COPY src /app/src
 
+# Copy nemotron-ocr wheel for installation
+COPY models/nemotron-ocr-v1/nemotron-ocr/dist/nemotron_ocr-1.0.0-py3-none-any.whl /tmp/
+COPY models/nemotron-ocr-v1/checkpoints /app/models/nemotron-ocr-v1/checkpoints
+
 # Note: data/ and models/ directories are excluded via .dockerignore
 # Mount them as volumes at runtime:
 #   -v /path/to/data:/app/data
 #   -v /path/to/models:/app/models
 
-# Create venv with python3.12
-RUN python -m venv /opt/venv
+# Create venv with UV using python3.12 and install dependencies
+RUN /root/.local/bin/uv venv /opt/venv --python python3.12
 ENV PATH="/opt/venv/bin:${PATH}"
 
-# Install project in editable mode
-RUN pip install -e .
+# Install nemotron-ocr wheel first
+RUN /root/.local/bin/uv pip install /tmp/nemotron_ocr-1.0.0-py3-none-any.whl
+
+# Install project dependencies with UV pip
+RUN /root/.local/bin/uv pip install .
 
 # Set model paths environment variable
 ENV NEMOTRON_OCR_MODEL_DIR=/app/models/nemotron-ocr-v1/checkpoints

@@ -7,7 +7,7 @@ from pathlib import Path
 import requests
 
 
-def test_health_check(base_url: str = "http://localhost:8000"):
+def test_health_check(base_url: str = "http://localhost:7670"):
     """Test the health check endpoint."""
     print("Testing health check...")
     response = requests.get(f"{base_url}/")
@@ -16,7 +16,7 @@ def test_health_check(base_url: str = "http://localhost:8000"):
     print()
 
 
-def process_single_pdf(pdf_path: str, base_url: str = "http://localhost:8000", dpi: float = 150.0):
+def process_single_pdf(pdf_path: str, base_url: str = "http://localhost:7670", dpi: float = 150.0):
     """Process a single PDF file."""
     print(f"Processing single PDF: {pdf_path}")
     
@@ -44,7 +44,7 @@ def process_single_pdf(pdf_path: str, base_url: str = "http://localhost:8000", d
         return None
 
 
-def process_multiple_pdfs(pdf_paths: list[str], base_url: str = "http://localhost:8000", dpi: float = 150.0):
+def process_multiple_pdfs(pdf_paths: list[str], base_url: str = "http://localhost:7670", dpi: float = 150.0):
     """Process multiple PDF files."""
     print(f"Processing {len(pdf_paths)} PDFs")
     
@@ -86,7 +86,7 @@ def main():
         print("  python test_client.py doc1.pdf doc2.pdf doc3.pdf")
         sys.exit(1)
     
-    base_url = "http://localhost:8000"
+    base_url = "http://localhost:7670"
     
     # Test health check
     test_health_check(base_url)

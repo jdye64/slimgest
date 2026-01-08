@@ -6,6 +6,9 @@ from torch import nn
 import torch
 import time
 import json
+import io
+from PIL import Image
+import numpy as np
 
 from nemotron_page_elements_v3.model import define_model as define_model_page_elements
 from nemotron_page_elements_v3.model import resize_pad as resize_pad_page_elements
@@ -26,6 +29,22 @@ app = typer.Typer(help="Simpliest pipeline with limited CPU parallelism while us
 install(show_locals=False)
 console = Console()
 
+
+def tensor_to_pil_image(tensor):
+    """
+    Converts a 3xHxW torch tensor [0,1] or [0,255] on cpu/gpu to PIL Image (RGB).
+    Assumes tensor is [C,H,W] and in standard format, does NOT do normalization undoing.
+    """
+    if tensor.device != torch.device('cpu'):
+        tensor = tensor.cpu()
+    # Clamp and convert to uint8
+    arr = tensor.detach().numpy()
+    if arr.max() <= 1.0:
+        arr = arr * 255.
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    arr = np.transpose(arr, (1, 2, 0))  # HWC
+    img = Image.fromarray(arr, mode='RGB')
+    return img
 
 def process_pdf_pages(
     pdf_path,
@@ -90,8 +109,13 @@ def process_pdf_pages(
                     print(f"Page {page_number} - Graphic elements results: {graphic_preds}")
             
             # Run OCR on the original (un-resized) tensor
-            ocr_preds = ocr_model(original_tensor)
-            
+            # Convert the tensor to a PIL image, then to a BytesIO JPEG for OCR model
+            pil_img = tensor_to_pil_image(original_tensor)
+            img_bytesio = io.BytesIO()
+            pil_img.save(img_bytesio, format="JPEG")
+            img_bytesio.seek(0)
+            ocr_preds = ocr_model(img_bytesio)
+
             for pred in ocr_preds:
                 page_ocr_results.append(str(pred['text']))
                 page_raw_ocr_results.append(str(pred))
