@@ -69,7 +69,7 @@ spec:
         - name: data
           mountPath: {{ .Values.volumes.data.mountPath }}
         {{- end }}
-        {{- with .Values.volumeMounts }}
+        {{- with .Values.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       volumes:
@@ -90,7 +90,7 @@ spec:
           type: {{ .Values.volumes.data.hostPath.type }}
         {{- end }}
       {{- end }}
-      {{- with .Values.volumes }}
+      {{- with .Values.extraVolumes }}
       {{- toYaml . | nindent 6 }}
       {{- end }}
       {{- with .Values.nodeSelector }}
