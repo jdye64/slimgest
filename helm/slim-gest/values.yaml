@@ -1,0 +1,164 @@
+# Default values for slim-gest
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+replicaCount: 1
+
+image:
+  repository: "nvcr.io/nvidia/nemo-microservices/nv-ingest"
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: "slim-26.3.0-001"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Automatically mount a ServiceAccount's API credentials?
+  automount: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext: {}
+  # fsGroup: 2000
+
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  type: ClusterIP
+  port: 7670
+  targetPort: 7670
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: slim-gest.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: slim-gest-tls
+  #    hosts:
+  #      - slim-gest.local
+
+resources:
+  # We recommend setting resource requests and limits for GPU workloads
+  limits:
+    nvidia.com/gpu: 1
+    memory: 48Gi
+    cpu: 24000m
+  requests:
+    nvidia.com/gpu: 1
+    memory: 24Gi
+    cpu: 12000m
+
+# GPU configuration
+gpu:
+  enabled: true
+  # Number of GPUs to request
+  count: 1
+
+# Application configuration
+app:
+  # Port the application listens on
+  port: 7670
+  # Model directory path inside container
+  modelDir: /app/models/nemotron-ocr-v1/checkpoints
+
+# Volume configuration for models
+# You need to provide a persistent volume or host path with the models
+volumes:
+  models:
+    # Type of volume: persistentVolumeClaim, hostPath, or configMap
+    type: hostPath
+    # For hostPath type
+    hostPath:
+      path: /path/to/models
+      type: Directory
+    # For persistentVolumeClaim type (uncomment and configure if using PVC)
+    # persistentVolumeClaim:
+    #   claimName: slim-gest-models
+    mountPath: /app/models
+
+# Optional: Volume for data directory
+  data:
+    enabled: false
+    type: hostPath
+    hostPath:
+      path: /path/to/data
+      type: Directory
+    mountPath: /app/data
+
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+  # targetMemoryUtilizationPercentage: 80
+
+# Additional volumes on the output Deployment definition.
+volumes: []
+# - name: foo
+#   secret:
+#     secretName: mysecret
+#     optional: false
+
+# Additional volumeMounts on the output Deployment definition.
+volumeMounts: []
+# - name: foo
+#   mountPath: "/etc/foo"
+#   readOnly: true
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+  # Example: Run only on nodes with GPU
+  # nodeAffinity:
+  #   requiredDuringSchedulingIgnoredDuringExecution:
+  #     nodeSelectorTerms:
+  #     - matchExpressions:
+  #       - key: accelerator
+  #         operator: In
+  #         values:
+  #         - nvidia-gpu

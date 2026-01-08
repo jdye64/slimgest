@@ -1,0 +1,14 @@
+apiVersion: v2
+name: slim-gest
+description: A Helm chart for slim-gest PDF OCR service with GPU acceleration
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - ocr
+  - pdf
+  - fastapi
+  - gpu
+  - cuda
+maintainers:
+  - name: slim-gest
