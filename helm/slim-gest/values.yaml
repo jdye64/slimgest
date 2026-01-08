@@ -125,6 +125,12 @@ affinity: {}
   #         - nvidia-gpu
 
 
+## @section Image Pull Secrets
+## @param imagePullSecrets[].name List of secret names needed for the main container and any init containers
+imagePullSecrets:
+  - name: ngc-api
+  - name: ngc-secret
+
 ## @param ngcApiSecret.create Specifies whether to create the ngc api secret
 ## @param ngcApiSecret.password The password to use for the NGC Secret
 ngcApiSecret:
