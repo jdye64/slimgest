@@ -110,11 +110,11 @@ def process_pdf_pages(
             
             # Run OCR on the original (un-resized) tensor
             # Convert the tensor to a PIL image, then to a BytesIO JPEG for OCR model
-            pil_img = tensor_to_pil_image(original_tensor)
-            img_bytesio = io.BytesIO()
-            pil_img.save(img_bytesio, format="JPEG")
-            img_bytesio.seek(0)
-            ocr_preds = ocr_model(img_bytesio)
+            # pil_img = tensor_to_pil_image(original_tensor)
+            # img_bytesio = io.BytesIO()
+            # pil_img.save(img_bytesio, format="JPEG")
+            # img_bytesio.seek(0)
+            ocr_preds = ocr_model(tensor.clone().to(device="cuda"))
 
             for pred in ocr_preds:
                 page_ocr_results.append(str(pred['text']))

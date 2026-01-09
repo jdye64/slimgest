@@ -30,3 +30,6 @@ models
 
 # Ignore private directory
 private/
+
+# Ignore output directories
+output/

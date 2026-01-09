@@ -98,8 +98,8 @@ readinessProbe:
     path: /
     port: http
   initialDelaySeconds: 10
-  periodSeconds: 5
-  timeoutSeconds: 3
+  periodSeconds: 30
+  timeoutSeconds: 10
   failureThreshold: 3
 
 autoscaling:

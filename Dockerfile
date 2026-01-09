@@ -59,7 +59,5 @@ ENV NEMOTRON_OCR_MODEL_DIR=/app/models/nemotron-ocr-v1/checkpoints
 # Expose web server port
 EXPOSE 7670
 
-# Default command: run FastAPI web server
-CMD ["uvicorn", "slimgest.web:app", "--host", "0.0.0.0", "--port", "7670"]
-
-
+# Default command: run FastAPI web server with 1 workers
+CMD ["uvicorn", "slimgest.web:app", "--host", "0.0.0.0", "--port", "7670", "--workers", "1"]

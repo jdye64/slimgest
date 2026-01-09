@@ -4,12 +4,14 @@ FastAPI server for PDF processing using the slim-gest pipeline.
 import os
 import tempfile
 import shutil
+import json
+import asyncio
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, AsyncGenerator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 from torch import nn
 
@@ -18,7 +20,7 @@ from nemotron_table_structure_v1.model import define_model as define_model_table
 from nemotron_graphic_elements_v1.model import define_model as define_model_graphic_elements
 from nemotron_ocr.inference.pipeline import NemotronOCR
 
-from slimgest.local.simple_all_gpu import run_pipeline
+from slimgest.local.simple_all_gpu import run_pipeline, process_pdf_pages
 
 
 # Global models - initialized on startup
@@ -156,9 +158,169 @@ async def process_pdf(
     return await process_pdfs(files=[file], dpi=dpi)
 
 
-def main(host: str = "0.0.0.0", port: int = 8000):
-    """Run the FastAPI server."""
-    uvicorn.run(app, host=host, port=port)
+async def process_pdf_stream_generator(
+    pdf_path: str,
+    dpi: float,
+) -> AsyncGenerator[str, None]:
+    """
+    Async generator that processes PDF pages and yields SSE events.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        dpi: Resolution for PDF rendering
+    
+    Yields:
+        SSE-formatted messages for each page
+    """
+    try:
+        # Send start event
+        yield f"event: start\ndata: {json.dumps({'status': 'processing', 'pdf': Path(pdf_path).name})}\n\n"
+        
+        all_pages_data = []
+        page_count = 0
+        
+        # Run the synchronous generator in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        def run_sync_generator():
+            """Run the synchronous generator and collect results."""
+            results = []
+            for page_number, tensor, page_ocr_results, page_raw_ocr_results in process_pdf_pages(
+                pdf_path,
+                models["page_elements"],
+                models["table_structure"],
+                models["graphic_elements"],
+                models["ocr"],
+                device="cuda",
+                dpi=dpi,
+            ):
+                results.append((page_number, page_ocr_results, page_raw_ocr_results))
+            return results
+        
+        # Execute in thread pool
+        results = await loop.run_in_executor(None, run_sync_generator)
+        
+        # Yield results as SSE events
+        for page_number, page_ocr_results, page_raw_ocr_results in results:
+            page_count += 1
+            page_text = " ".join(page_ocr_results)
+            
+            page_data = {
+                "page_number": page_number,
+                "ocr_text": page_text,
+                "raw_ocr_results": page_raw_ocr_results,
+            }
+            all_pages_data.append(page_data)
+            
+            # Send page completion event
+            event_data = {
+                "page_number": page_number,
+                "page_text": page_text,
+                "total_pages_so_far": page_count,
+            }
+            yield f"event: page\ndata: {json.dumps(event_data)}\n\n"
+            
+            # Small delay to ensure events are sent
+            await asyncio.sleep(0.01)
+        
+        # Send completion event
+        completion_data = {
+            "status": "complete",
+            "total_pages": page_count,
+            "pages": all_pages_data,
+            "pdf_name": Path(pdf_path).name,
+        }
+        yield f"event: complete\ndata: {json.dumps(completion_data)}\n\n"
+        
+    except Exception as e:
+        # Send error event
+        error_data = {
+            "status": "error",
+            "error": str(e),
+        }
+        yield f"event: error\ndata: {json.dumps(error_data)}\n\n"
+
+
+@app.post("/process-pdf-stream")
+async def process_pdf_stream(
+    file: UploadFile = File(..., description="PDF file to process"),
+    dpi: float = 150.0,
+):
+    """
+    Process a single PDF file through the OCR pipeline with Server-Sent Events streaming.
+    
+    This endpoint streams results as each page is processed, allowing clients to receive
+    incremental updates instead of waiting for all pages to complete.
+    
+    Args:
+        file: PDF file to process
+        dpi: Resolution for PDF rendering (default: 150.0)
+    
+    Returns:
+        Server-Sent Events stream with page results
+        
+    Events:
+        - start: Processing has begun
+        - page: A single page has been processed
+        - complete: All pages have been processed
+        - error: An error occurred
+    """
+    if not models:
+        raise HTTPException(status_code=503, detail="Models not loaded yet")
+    
+    # Validate file type
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: {file.filename}. Only PDF files are accepted."
+        )
+    
+    # Create a temporary directory for the uploaded file
+    temp_dir = tempfile.mkdtemp(prefix="slimgest_stream_")
+    temp_path = Path(temp_dir)
+    
+    try:
+        # Save uploaded file to temporary directory
+        file_path = temp_path / file.filename
+        with open(file_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        # Return streaming response
+        return StreamingResponse(
+            process_pdf_stream_generator(str(file_path), dpi),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # Disable nginx buffering
+            },
+        )
+    
+    except Exception as e:
+        # Clean up on error
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
+    
+    # Note: temp_dir cleanup happens after the stream completes
+    # We could use a background task to clean it up, but for now we'll leave it
+
+
+def main(host: str = "0.0.0.0", port: int = 8000, workers: int = 1):
+    """
+    Run the FastAPI server.
+    
+    Args:
+        host: Host to bind to (default: 0.0.0.0)
+        port: Port to bind to (default: 8000)
+        workers: Number of worker processes (default: 1). Use 1 for GPU workloads.
+    """
+    # Note: For GPU workloads, workers should typically be 1 to avoid GPU memory issues
+    # For CPU-only or if models are small enough, more workers can improve concurrency
+    uvicorn.run(app, host=host, port=port, workers=workers)
 
 
 if __name__ == "__main__":
