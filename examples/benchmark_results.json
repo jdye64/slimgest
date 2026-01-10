@@ -1,0 +1,357 @@
+{
+  "timestamp": "2026-01-10 15:11:58",
+  "python": {
+    "statistics": {
+      "server": "Python",
+      "total_requests": 20,
+      "successful_requests": 20,
+      "failed_requests": 0,
+      "total_latency": 53.761873960494995,
+      "avg_latency": 2.68809369802475,
+      "min_latency": 0.11588335037231445,
+      "max_latency": 15.721188068389893,
+      "total_pages": 496,
+      "pages_per_second": 9.225868881811449,
+      "requests_per_second": 0.37201084200852613
+    },
+    "individual_results": [
+      {
+        "server": "Python",
+        "filename": "1061225.pdf",
+        "success": true,
+        "latency": 4.641650676727295,
+        "total_pages": 44,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1620834.pdf",
+        "success": true,
+        "latency": 2.194845199584961,
+        "total_pages": 15,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "2189929.pdf",
+        "success": true,
+        "latency": 0.5496547222137451,
+        "total_pages": 3,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1177640.pdf",
+        "success": true,
+        "latency": 2.293649435043335,
+        "total_pages": 18,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1666072.pdf",
+        "success": true,
+        "latency": 0.11588335037231445,
+        "total_pages": 1,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "2399488.pdf",
+        "success": true,
+        "latency": 0.12208008766174316,
+        "total_pages": 1,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1238975.pdf",
+        "success": true,
+        "latency": 0.6471383571624756,
+        "total_pages": 5,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1690009.pdf",
+        "success": true,
+        "latency": 3.649245262145996,
+        "total_pages": 31,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1043219.pdf",
+        "success": true,
+        "latency": 0.20867443084716797,
+        "total_pages": 2,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1375277.pdf",
+        "success": true,
+        "latency": 6.09427285194397,
+        "total_pages": 51,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "2049749.pdf",
+        "success": true,
+        "latency": 3.205662965774536,
+        "total_pages": 47,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1037700.pdf",
+        "success": true,
+        "latency": 1.9489285945892334,
+        "total_pages": 24,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1422550.pdf",
+        "success": true,
+        "latency": 2.2874691486358643,
+        "total_pages": 19,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "2062555.pdf",
+        "success": true,
+        "latency": 15.721188068389893,
+        "total_pages": 116,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1016445.pdf",
+        "success": true,
+        "latency": 0.2074124813079834,
+        "total_pages": 2,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1479052.pdf",
+        "success": true,
+        "latency": 0.22269082069396973,
+        "total_pages": 3,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "2127440.pdf",
+        "success": true,
+        "latency": 1.0874693393707275,
+        "total_pages": 9,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "1598224.pdf",
+        "success": true,
+        "latency": 5.779724359512329,
+        "total_pages": 83,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "2132230.pdf",
+        "success": true,
+        "latency": 0.37027525901794434,
+        "total_pages": 2,
+        "error": ""
+      },
+      {
+        "server": "Python",
+        "filename": "2151932.pdf",
+        "success": true,
+        "latency": 2.4139585494995117,
+        "total_pages": 20,
+        "error": ""
+      }
+    ]
+  },
+  "rust": {
+    "statistics": {
+      "server": "Rust",
+      "total_requests": 20,
+      "successful_requests": 20,
+      "failed_requests": 0,
+      "total_latency": 55.383601665496826,
+      "avg_latency": 2.769180083274841,
+      "min_latency": 0.12343955039978027,
+      "max_latency": 16.38558292388916,
+      "total_pages": 496,
+      "pages_per_second": 8.955719474434266,
+      "requests_per_second": 0.3611177207433172
+    },
+    "individual_results": [
+      {
+        "server": "Rust",
+        "filename": "1177640.pdf",
+        "success": true,
+        "latency": 3.2598021030426025,
+        "total_pages": 18,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1620834.pdf",
+        "success": true,
+        "latency": 2.091111898422241,
+        "total_pages": 15,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1238975.pdf",
+        "success": true,
+        "latency": 0.6715917587280273,
+        "total_pages": 5,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1690009.pdf",
+        "success": true,
+        "latency": 3.753983497619629,
+        "total_pages": 31,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "2062555.pdf",
+        "success": true,
+        "latency": 16.38558292388916,
+        "total_pages": 116,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1016445.pdf",
+        "success": true,
+        "latency": 0.21377944946289062,
+        "total_pages": 2,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1666072.pdf",
+        "success": true,
+        "latency": 0.12343955039978027,
+        "total_pages": 1,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "2049749.pdf",
+        "success": true,
+        "latency": 3.3414134979248047,
+        "total_pages": 47,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "2127440.pdf",
+        "success": true,
+        "latency": 1.1489503383636475,
+        "total_pages": 9,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "2132230.pdf",
+        "success": true,
+        "latency": 0.37972092628479004,
+        "total_pages": 2,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "2151932.pdf",
+        "success": true,
+        "latency": 2.481184482574463,
+        "total_pages": 20,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "2399488.pdf",
+        "success": true,
+        "latency": 0.1268906593322754,
+        "total_pages": 1,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1037700.pdf",
+        "success": true,
+        "latency": 1.997931957244873,
+        "total_pages": 24,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1479052.pdf",
+        "success": true,
+        "latency": 0.24060487747192383,
+        "total_pages": 3,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1043219.pdf",
+        "success": true,
+        "latency": 0.20869088172912598,
+        "total_pages": 2,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1422550.pdf",
+        "success": true,
+        "latency": 2.374785900115967,
+        "total_pages": 19,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "2189929.pdf",
+        "success": true,
+        "latency": 0.5717790126800537,
+        "total_pages": 3,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1061225.pdf",
+        "success": true,
+        "latency": 3.919461250305176,
+        "total_pages": 44,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1375277.pdf",
+        "success": true,
+        "latency": 6.10302996635437,
+        "total_pages": 51,
+        "error": ""
+      },
+      {
+        "server": "Rust",
+        "filename": "1598224.pdf",
+        "success": true,
+        "latency": 5.989866733551025,
+        "total_pages": 83,
+        "error": ""
+      }
+    ]
+  }
+}

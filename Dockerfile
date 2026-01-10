@@ -10,22 +10,30 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3.12 python3.12-venv python3.12-dev \
       git curl ca-certificates build-essential \
-      libgl1 libglib2.0-0 libgomp1 && \
+      libgl1 libglib2.0-0 libgomp1 \
+      pkg-config libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # Ensure python/pip aliases point to python3.12
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
 
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
 # Install UV for fast package installation
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
+ENV PATH="/root/.local/bin:${PATH}"
+ENV UV_HTTP_TIMEOUT=300
+ENV UV_CONCURRENT_DOWNLOADS=4
 
 WORKDIR /app
 
 # Copy project files first to leverage Docker layer caching
 COPY pyproject.toml README.md /app/
 COPY src /app/src
+COPY web_rust /app/web_rust
 
 # Copy nemotron-ocr wheel for installation
 COPY models/nemotron-ocr-v1/nemotron-ocr/dist/nemotron_ocr-1.0.0-py3-none-any.whl /tmp/
@@ -53,11 +61,36 @@ RUN /root/.local/bin/uv pip install . \
   --index-url https://download.pytorch.org/whl/cu128 \
   --extra-index-url https://pypi.org/simple
 
+# Build Rust web server
+WORKDIR /app/web_rust
+RUN cargo build --release
+
+WORKDIR /app
+
 # Set model paths environment variable
 ENV NEMOTRON_OCR_MODEL_DIR=/app/models/nemotron-ocr-v1/checkpoints
 
-# Expose web server port
-EXPOSE 7670
+# #region agent log
+# Set Python I/O encoding to UTF-8 (Hypothesis A, E)
+ENV PYTHONIOENCODING=utf-8
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+# #endregion
 
-# Default command: run FastAPI web server with 1 workers
-CMD ["uvicorn", "slimgest.web:app", "--host", "0.0.0.0", "--port", "7670", "--workers", "1"]
+# Expose web server ports (Python: 7670, Rust: 7671)
+EXPOSE 7670 7671
+
+# Create startup script to run both servers
+RUN echo '#!/bin/bash\n\
+# Start Python server in background\n\
+uvicorn slimgest.web:app --host 0.0.0.0 --port 7670 --workers 1 &\n\
+\n\
+# Wait a moment for Python server to start\n\
+sleep 2\n\
+\n\
+# Start Rust server in foreground\n\
+/app/web_rust/target/release/slimgest-web-rust\n\
+' > /app/start_servers.sh && chmod +x /app/start_servers.sh
+
+# Default command: run both web servers
+CMD ["/app/start_servers.sh"]

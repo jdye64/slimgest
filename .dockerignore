@@ -40,5 +40,9 @@ dist/
 build/
 *.egg-info/
 
+# Rust build artifacts
+web_rust/target/
+web_rust/Cargo.lock
+
 # Private notes
 private/

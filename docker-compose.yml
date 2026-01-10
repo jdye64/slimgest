@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  slimgest:
+    build: .
+    image: slimgest:latest
+    container_name: slimgest-benchmark
+    ports:
+      - "7670:7670"  # Python FastAPI server
+      - "7671:7671"  # Rust Axum server
+    volumes:
+      - ./models:/app/models
+      - ./data:/app/data
+    environment:
+      - NEMOTRON_OCR_MODEL_DIR=/app/models/nemotron-ocr-v1/checkpoints
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7670/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

@@ -1,0 +1,186 @@
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Slim-Gest Architecture                               │
+│                    Python FastAPI vs Rust Axum Comparison                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                              Client Request
+                                    │
+                    ┌───────────────┴───────────────┐
+                    │                               │
+                    ▼                               ▼
+        ┌─────────────────────┐       ┌─────────────────────┐
+        │   Python FastAPI    │       │    Rust Axum        │
+        │   Port: 7670        │       │    Port: 7671       │
+        │                     │       │                     │
+        │  • Starlette HTTP   │       │  • Axum HTTP        │
+        │  • Python JSON      │       │  • Serde JSON       │
+        │  • asyncio          │       │  • Tokio async      │
+        │  • Native Python    │       │  • PyO3 bridge      │
+        └──────────┬──────────┘       └──────────┬──────────┘
+                   │                              │
+                   │        ┌─────────────────────┘
+                   │        │
+                   ▼        ▼
+        ┌──────────────────────────────┐
+        │     Python ML Pipeline       │
+        │                              │
+        │  ┌────────────────────────┐  │
+        │  │  Nemotron Models       │  │
+        │  │  • Page Elements       │  │
+        │  │  • Table Structure     │  │
+        │  │  • Graphic Elements    │  │
+        │  └────────────────────────┘  │
+        │                              │
+        │  ┌────────────────────────┐  │
+        │  │  OCR Pipeline          │  │
+        │  │  • PDF Rendering       │  │
+        │  │  • Tensor Processing   │  │
+        │  │  • Text Extraction     │  │
+        │  └────────────────────────┘  │
+        │                              │
+        │  Running on CUDA GPU         │
+        └──────────────┬───────────────┘
+                       │
+                       ▼
+                  OCR Results
+                       │
+        ┌──────────────┴──────────────┐
+        │                             │
+        ▼                             ▼
+  JSON Response                 JSON Response
+  (Python FastAPI)              (Rust Axum)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         Benchmarking Flow                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  Directory of PDFs
+        │
+        ▼
+  ┌──────────────────────┐
+  │ benchmark_servers.py │
+  └──────────┬───────────┘
+             │
+    ┌────────┴─────────┐
+    │                  │
+    ▼                  ▼
+┌─────────┐        ┌─────────┐
+│ Python  │        │  Rust   │
+│ Server  │        │ Server  │
+│  7670   │        │  7671   │
+└────┬────┘        └────┬────┘
+     │                  │
+     └────────┬─────────┘
+              │
+              ▼
+     Collect Metrics:
+     • Latency per PDF
+     • Total pages processed
+     • Success/failure rate
+     • Throughput
+              │
+              ▼
+     ┌──────────────────┐
+     │  Comparison      │
+     │  Table + Report  │
+     └──────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      Performance Measurement                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Total Request Time = Web Layer Time + ML Processing Time
+
+┌────────────────────────────────────────────────────────────┐
+│ Python FastAPI Request                                     │
+├──────────────┬─────────────────────────────────────────────┤
+│ Web Layer    │          ML Processing (GPU)                │
+│ (Measured)   │          (Same for both)                    │
+│   ~50-200ms  │          ~2000-5000ms                       │
+└──────────────┴─────────────────────────────────────────────┘
+Total: ~2050-5200ms
+
+┌────────────────────────────────────────────────────────────┐
+│ Rust Axum Request                                          │
+├──────────┬─────────────────────────────────────────────────┤
+│ Web Layer│          ML Processing (GPU)                    │
+│ (Faster) │          (Same for both)                        │
+│ ~30-150ms│          ~2000-5000ms                           │
+└──────────┴─────────────────────────────────────────────────┘
+Total: ~2030-5150ms
+
+Improvement: 20-50ms (1-3% for large PDFs, 5-10% for small PDFs)
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Docker Container                                    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────────────────┐
+│  slimgest-benchmark Container                                             │
+│                                                                           │
+│  ┌──────────────────────┐        ┌─────────────────────────┐            │
+│  │  Python Process      │        │  Rust Process           │            │
+│  │  uvicorn :7670       │        │  slimgest-web-rust :7671│            │
+│  └──────────────────────┘        └─────────────────────────┘            │
+│                                                                           │
+│  ┌───────────────────────────────────────────────────────────┐           │
+│  │  Shared Components                                        │           │
+│  │  • Python ML Models (Nemotron, OCR)                      │           │
+│  │  • CUDA Runtime                                          │           │
+│  │  • Model Weights (/app/models)                           │           │
+│  └───────────────────────────────────────────────────────────┘           │
+│                                                                           │
+│  Host Mounts:                                                             │
+│  • models/ → /app/models                                                 │
+│  • data/ → /app/data                                                     │
+│                                                                           │
+│  GPU Access: --gpus all                                                   │
+└───────────────────────────────────────────────────────────────────────────┘
+           │                              │
+           │                              │
+      Port 7670                      Port 7671
+           │                              │
+           └──────────────┬───────────────┘
+                          │
+                     Host Network
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        File Structure                                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+slim-gest/
+├── src/slimgest/web/__main__.py  ← Python FastAPI server
+│
+├── web_rust/                      ← NEW: Rust Axum server
+│   ├── Cargo.toml
+│   ├── src/
+│   │   ├── main.rs               ← Server entry point
+│   │   ├── handlers.rs           ← HTTP handlers
+│   │   ├── python_bridge.rs      ← PyO3 ML model access
+│   │   ├── models.rs             ← Data structures
+│   │   └── lib.rs
+│   └── README.md
+│
+├── examples/                      ← NEW: Benchmark scripts
+│   ├── benchmark_servers.py      ← Full benchmark
+│   └── test_servers.py           ← Quick test
+│
+├── scripts/
+│   └── benchmark.sh              ← NEW: Shell helper
+│
+├── Dockerfile                     ← MODIFIED: Builds both servers
+├── docker-compose.yml            ← NEW: Easy deployment
+├── Makefile                      ← NEW: Make targets
+│
+└── Documentation/                 ← NEW: Guides
+    ├── BENCHMARKING.md
+    ├── IMPLEMENTATION_SUMMARY.md
+    ├── VERIFICATION_CHECKLIST.md
+    ├── QUICK_REFERENCE.md
+    └── PROJECT_COMPLETION_REPORT.md
+```

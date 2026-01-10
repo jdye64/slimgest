@@ -136,12 +136,32 @@ slimgest-client follow <job_id> --server http://localhost:8000
 Docker Support
 --------------
 
-A Dockerfile is provided for containerized deployment. Build and run:
+A Dockerfile is provided for containerized deployment with both Python and Rust web servers:
 
 ```bash
 docker build -t slimgest .
-docker run -it slimgest
+docker run -p 7670:7670 -p 7671:7671 -v /path/to/models:/app/models slimgest
 ```
+
+The container runs two web servers:
+- **Python FastAPI server**: Port 7670
+- **Rust Axum server**: Port 7671
+
+Both servers provide identical APIs for PDF processing. The Rust server uses PyO3 to call the same Python ML models but with lower web layer overhead.
+
+### Benchmarking Python vs Rust
+
+To compare performance between the two servers:
+
+```bash
+python examples/benchmark_servers.py /path/to/pdfs \
+    --python-url http://localhost:7670 \
+    --rust-url http://localhost:7671 \
+    --dpi 150 \
+    --output benchmark_results.json
+```
+
+See `web_rust/README.md` for more details on the Rust implementation.
 
 Project Structure
 -----------------
