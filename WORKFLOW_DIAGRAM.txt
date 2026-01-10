@@ -1,0 +1,352 @@
+═══════════════════════════════════════════════════════════════════════════════
+                     CLIENT-SIDE BATCH PROCESSING WORKFLOW
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                  CLIENT SIDE                                │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────┐
+    │  Input PDFs  │
+    │  (directory  │
+    │   or file)   │
+    └──────┬───────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │  Initialize Metrics      │
+    │  - Total files          │
+    │  - Total bytes          │
+    │  - Start timer          │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │  For Each PDF:           │
+    │  ┌────────────────────┐ │
+    │  │ 1. Load PDF        │ │
+    │  │ 2. Get page count  │ │
+    │  │ 3. Get file size   │ │
+    │  └────────┬───────────┘ │
+    │           │              │
+    │           ▼              │
+    │  ┌────────────────────┐ │
+    │  │ Render Pages       │ │
+    │  │ (pypdfium2)        │ │
+    │  │ - Convert to PIL   │ │
+    │  │ - Save as PNG      │ │
+    │  │ - Encode base64    │ │
+    │  │                    │ │
+    │  │ [Track render time]│ │
+    │  └────────┬───────────┘ │
+    │           │              │
+    │           ▼              │
+    │  ┌────────────────────┐ │
+    │  │ Batch Pages        │ │
+    │  │ - Groups of 32     │ │
+    │  │ - Configurable     │ │
+    │  └────────┬───────────┘ │
+    │           │              │
+    │           ▼              │
+    │  ┌────────────────────┐ │
+    │  │ For Each Batch:    │ │
+    │  │ ┌────────────────┐ │ │
+    │  │ │ Send to Server │ │ │
+    │  │ │ (HTTP POST)    │─┼─┼──────┐
+    │  │ └────────────────┘ │ │      │
+    │  └────────────────────┘ │      │
+    └──────────────────────────┘      │
+                                       │
+                                       │
+         ┌─────────────────────────────┘
+         │
+         │ HTTP POST /process-batch-stream
+         │ Content-Type: application/json
+         │
+         │ {
+         │   "images": [
+         │     {"page_number": 1, "image_base64": "iVBOR..."},
+         │     {"page_number": 2, "image_base64": "iVBOR..."},
+         │     ...
+         │   ]
+         │ }
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                 SERVER SIDE                                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────┐
+    │  Receive Batch Request   │
+    │  - Validate batch size   │
+    │  - Check models loaded   │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │  Decode Images           │
+    │  - Base64 to bytes       │
+    │  - Bytes to PIL Image    │
+    │  - PIL to Tensor         │
+    │  - Move to GPU           │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │  Process Batch           │
+    │  (process_image_batch)   │
+    │                          │
+    │  For Each Image:         │
+    │  ┌────────────────────┐ │
+    │  │ Page Elements      │ │
+    │  │ Detection Model    │ │
+    │  └────────┬───────────┘ │
+    │           │              │
+    │           ▼              │
+    │  ┌────────────────────┐ │
+    │  │ Table Structure    │ │
+    │  │ Detection Model    │ │
+    │  └────────┬───────────┘ │
+    │           │              │
+    │           ▼              │
+    │  ┌────────────────────┐ │
+    │  │ Graphic Elements   │ │
+    │  │ Detection Model    │ │
+    │  └────────┬───────────┘ │
+    │           │              │
+    │           ▼              │
+    │  ┌────────────────────┐ │
+    │  │ OCR Model          │ │
+    │  │ (Nemotron OCR)     │ │
+    │  │ - Extract text     │ │
+    │  │ - Get bounding box │ │
+    │  └────────┬───────────┘ │
+    │           │              │
+    │  ┌────────▼───────────┐ │
+    │  │ Yield Page Result  │─┼──┐
+    │  └────────────────────┘ │  │
+    └──────────────────────────┘  │
+                                   │
+                                   │ SSE Stream
+                                   │
+         ┌─────────────────────────┘
+         │
+         │ event: start
+         │ data: {"status": "processing", "batch_size": 32}
+         │
+         │ event: page
+         │ data: {"page_number": 1, "ocr_text": "...", "raw_ocr_results": [...]}
+         │
+         │ event: page
+         │ data: {"page_number": 2, "ocr_text": "...", "raw_ocr_results": [...]}
+         │
+         │ event: complete
+         │ data: {"status": "complete", "pages_processed": 32}
+         │
+         ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              CLIENT SIDE (CONT.)                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+    ┌──────────────────────────┐
+    │  Receive SSE Events      │
+    │  - Parse event stream    │
+    │  - Collect page results  │
+    │  - Update metrics        │
+    │    • Pages processed     │
+    │    • Batches completed   │
+    │    • Pages per second    │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │  Combine Results         │
+    │  - Sort by page number   │
+    │  - Join OCR text         │
+    │  - Aggregate metadata    │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │  Write Markdown File     │
+    │  - Document header       │
+    │  - Metadata              │
+    │  - Page-by-page text     │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │  Record PDF Metrics      │
+    │  - Total time            │
+    │  - Render time           │
+    │  - Processing time       │
+    │  - Page count            │
+    │  - File size             │
+    └──────┬───────────────────┘
+           │
+           ▼
+           ┃  (Repeat for next PDF)
+           ┃
+           ▼
+    ┌──────────────────────────┐
+    │  All PDFs Complete       │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │  Generate Performance    │
+    │  Chart                   │
+    │  - Pages/sec over time   │
+    │  - Average & peak stats  │
+    │  - Save as PNG           │
+    └──────┬───────────────────┘
+           │
+           ▼
+    ┌──────────────────────────┐
+    │  Print Summary Report    │
+    │                          │
+    │  ┌────────────────────┐ │
+    │  │ Overall Stats      │ │
+    │  │ - Total PDFs       │ │
+    │  │ - Total pages      │ │
+    │  │ - Total time       │ │
+    │  │ - Avg pages/sec    │ │
+    │  └────────────────────┘ │
+    │                          │
+    │  ┌────────────────────┐ │
+    │  │ Top 100 Slowest    │ │
+    │  │ - Ranked by time   │ │
+    │  │ - With file size   │ │
+    │  │ - With page count  │ │
+    │  └────────────────────┘ │
+    └──────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+                                  DATA FLOW
+═══════════════════════════════════════════════════════════════════════════════
+
+CLIENT                          NETWORK                         SERVER
+  │                               │                               │
+  │ [Load document.pdf]          │                               │
+  │ [145 pages, 12MB]            │                               │
+  │                               │                               │
+  │ [Render pages 1-32]          │                               │
+  │ [~8 seconds]                 │                               │
+  │                               │                               │
+  ├──[Batch 1: 32 pages]────────▶│──[POST 4.2MB JSON]──────────▶│
+  │                               │                               │
+  │                               │                               │ [Decode]
+  │                               │                               │ [Process]
+  │                               │                               │ [~5 sec]
+  │                               │                               │
+  │◀─[SSE: page 1 result]────────│◀─[Stream]────────────────────┤
+  │ [Update: 1/145 pages]        │                               │
+  │◀─[SSE: page 2 result]────────│◀─[Stream]────────────────────┤
+  │ [Update: 2/145 pages]        │                               │
+  │     ...                       │     ...                       │
+  │◀─[SSE: page 32 result]───────│◀─[Stream]────────────────────┤
+  │ [Update: 32/145 pages]       │                               │
+  │◀─[SSE: complete]─────────────│◀─[Stream]────────────────────┤
+  │                               │                               │
+  │ [Render pages 33-64]         │                               │
+  │ [~8 seconds]                 │                               │
+  │                               │                               │
+  ├──[Batch 2: 32 pages]────────▶│──[POST 4.2MB JSON]──────────▶│
+  │                               │                               │
+  │     ...                       │     ...                       │
+  │                               │                               │
+  │ [After 5 batches]            │                               │
+  │ [Combine all results]        │                               │
+  │ [Write markdown]             │                               │
+  │ [Record metrics]             │                               │
+  │                               │                               │
+  └──[Complete]                  │                               │
+
+═══════════════════════════════════════════════════════════════════════════════
+                              METRICS TRACKING
+═══════════════════════════════════════════════════════════════════════════════
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                             GLOBAL METRICS                                  │
+│                                                                             │
+│  Total PDFs: 100                    Completed: 98                          │
+│  Total Pages: 2,450                 Processed: 2,398                       │
+│  Total Bytes: 245,678,901           Read: 240,123,456                      │
+│  Batches Sent: 77                   In Flight: 2    Completed: 75          │
+│  Pages/Second: 13.5 (current)       Peak: 18.2      Average: 12.8          │
+│                                                                             │
+│  Time Breakdown:                                                            │
+│  ├─ Rendering:   35% (63.0s)                                              │
+│  ├─ Upload:      10% (18.0s)                                              │
+│  └─ Processing:  55% (99.0s)                                              │
+│                                                                             │
+│  Total Runtime: 180.0 seconds                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PER-PDF METRICS (Example)                         │
+│                                                                             │
+│  PDF: technical_manual.pdf                                                 │
+│  ├─ File Size: 4,567,890 bytes                                            │
+│  ├─ Pages: 87                                                              │
+│  ├─ Render Time: 15.3s                                                     │
+│  ├─ Processing Time: 28.7s                                                 │
+│  └─ Total Time: 44.0s                                                      │
+│                                                                             │
+│  Status: ✓ Complete                                                        │
+│  Output: ./output/technical_manual.md                                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        PERFORMANCE OVER TIME                                │
+│                                                                             │
+│  Pages/Second                                                               │
+│     20 ┤                        ╭─╮                                        │
+│     18 ┤                  ╭─────╯ ╰╮                                       │
+│     16 ┤             ╭────╯        ╰──╮                                    │
+│     14 ┤        ╭────╯                ╰─╮                                  │
+│     12 ┤   ╭────╯                       ╰──╮                               │
+│     10 ┤╭──╯                               ╰─╮                             │
+│      8 ┼╯                                    ╰───╮                         │
+│      0 └────┬────┬────┬────┬────┬────┬────┬────┴───                       │
+│            0s   30s  60s  90s  120s 150s 180s  Time                        │
+│                                                                             │
+│  Average: 12.8 pages/s    Peak: 18.2 pages/s                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+                           CONFIGURATION OPTIONS
+═══════════════════════════════════════════════════════════════════════════════
+
+┌────────────────────┬──────────────┬──────────────────────────────────────────┐
+│ Option             │ Default      │ Description                              │
+├────────────────────┼──────────────┼──────────────────────────────────────────┤
+│ --output-dir       │ ./output     │ Directory for markdown output            │
+│ --dpi              │ 150.0        │ PDF rendering resolution                 │
+│ --batch-size       │ 32           │ Pages per batch (1-64)                   │
+│ --workers          │ 4            │ Concurrent PDF processing threads        │
+│ --url              │ localhost:7670│ Server URL                              │
+└────────────────────┴──────────────┴──────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════════
+                            OUTPUT FILES STRUCTURE
+═══════════════════════════════════════════════════════════════════════════════
+
+output/
+├── document1.md                    # Markdown with OCR text
+├── document2.md                    # One file per PDF
+├── document3.md
+├── ...
+└── performance_chart.png           # Performance visualization
+
+Each .md file contains:
+  - Document metadata (size, pages, processing time)
+  - Full OCR text organized by page
+  - Timestamps and processing statistics
+
+performance_chart.png shows:
+  - Pages/second over time graph
+  - Average and peak performance statistics
+  - Visual performance trends
+
+═══════════════════════════════════════════════════════════════════════════════

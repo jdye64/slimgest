@@ -20,6 +20,7 @@ from nemotron_graphic_elements_v1.model import resize_pad as resize_pad_graphic_
 from nemotron_ocr.inference.pipeline import NemotronOCR
 
 import typer
+import base64
 
 # Import our new PDF processing utilities
 from slimgest.pdf.render import iter_pdf_page_tensors
@@ -45,6 +46,109 @@ def tensor_to_pil_image(tensor):
     arr = np.transpose(arr, (1, 2, 0))  # HWC
     img = Image.fromarray(arr, mode='RGB')
     return img
+
+
+def base64_to_tensor(base64_str: str, device: str = "cuda") -> torch.Tensor:
+    """
+    Convert a base64-encoded PNG image to a torch tensor [3, H, W].
+    
+    Args:
+        base64_str: Base64-encoded PNG image string
+        device: Device to place the tensor on
+    
+    Returns:
+        Tensor of shape [3, H, W] with values in range [0, 255]
+    """
+    # Decode base64 to bytes
+    img_bytes = base64.b64decode(base64_str)
+    
+    # Load as PIL Image
+    img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+    
+    # Convert to numpy array [H, W, 3]
+    arr = np.array(img, dtype=np.float32)
+    
+    # Convert to tensor [3, H, W]
+    tensor = torch.from_numpy(arr).permute(2, 0, 1)
+    
+    # Move to device
+    tensor = tensor.to(device)
+    
+    return tensor
+
+def process_image_batch(
+    image_tensors: List[torch.Tensor],
+    page_numbers: List[int],
+    page_elements_model,
+    table_structure_model,
+    graphic_element_model,
+    ocr_model,
+    device="cuda",
+):
+    """
+    Process a batch of pre-rendered page images (as tensors).
+    
+    Args:
+        image_tensors: List of image tensors [3, H, W] already on the specified device
+        page_numbers: List of page numbers corresponding to each tensor
+        page_elements_model, table_structure_model, graphic_element_model, ocr_model: Models to use
+        device: Device to run inference on
+    
+    Yields:
+        Tuple of (page_number, ocr_results, raw_ocr_results) for each image
+    """
+    page_elements_input_shape = (1024, 1024)
+    table_structure_input_shape = (1024, 1024)
+    graphic_elements_input_shape = (1024, 1024)
+    
+    for tensor, page_number in zip(image_tensors, page_numbers):
+        tensor = tensor.to(device)
+        bitmap_shape = (tensor.shape[1], tensor.shape[2])  # H, W from [3, H, W]
+        
+        page_ocr_results = []
+        page_raw_ocr_results = []
+        
+        with torch.inference_mode():
+            # Resize for page elements detection
+            resized_tensor = resize_pad_page_elements(tensor, page_elements_input_shape)
+            preds = page_elements_model(resized_tensor, bitmap_shape)[0]
+            boxes, labels, scores = postprocess_preds_page_element(
+                preds, page_elements_model.thresholds_per_class, page_elements_model.labels
+            )
+            
+            # Process detected elements (tables and graphics)
+            for label, box in zip(labels, boxes):
+                if label == 0:  # Table
+                    cropped = crop_tensor_with_bbox(
+                        resized_tensor, box, bitmap_shape, page_elements_input_shape
+                    ).clone()
+                    crop_shape = (cropped.shape[1], cropped.shape[2])
+                    cropped_resized = resize_pad_table_structure(cropped, table_structure_input_shape)
+                    table_preds = table_structure_model(cropped_resized, crop_shape)[0]
+                    
+                elif label in [1, 2, 3]:  # Graphic elements
+                    cropped = crop_tensor_with_bbox(
+                        resized_tensor, box, bitmap_shape, page_elements_input_shape
+                    ).clone()
+                    crop_shape = (cropped.shape[1], cropped.shape[2])
+                    cropped_resized = resize_pad_graphic_elements(cropped, graphic_elements_input_shape)
+                    graphic_preds = graphic_element_model(cropped_resized, crop_shape)[0]
+            
+            # Run OCR on the tensor
+            print(f"  Running OCR on page {page_number}, tensor shape: {tensor.shape}, device: {tensor.device}")
+            ocr_preds = ocr_model(tensor.clone().to(device="cuda"))
+            print(f"  OCR returned {len(ocr_preds) if ocr_preds else 0} predictions")
+
+            for pred in ocr_preds:
+                text = str(pred.get('text', ''))
+                if text:
+                    page_ocr_results.append(text)
+                page_raw_ocr_results.append(str(pred))
+            
+            print(f"  Page {page_number}: Extracted {len(page_ocr_results)} text blocks, total {sum(len(t) for t in page_ocr_results)} characters")
+        
+        yield page_number, page_ocr_results, page_raw_ocr_results
+
 
 def process_pdf_pages(
     pdf_path,
