@@ -8,6 +8,7 @@ This client:
 - Sends base64-encoded PNGs to the server
 - Provides rich progress tracking and metrics
 - Generates performance charts
+- Uses async HTTP for non-blocking concurrent requests
 """
 import sys
 import json
@@ -21,8 +22,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 from collections import defaultdict
 import io
+import asyncio
 
-import requests
+import httpx
 import pypdfium2 as pdfium
 from PIL import Image
 from rich.console import Console
@@ -248,18 +250,20 @@ def batch_pages(pages: List[Tuple[int, str, float]], batch_size: int = 32) -> Li
     return batches
 
 
-def send_batch_to_server(
+async def send_batch_to_server(
     batch: List[Tuple[int, str, float]],
     base_url: str,
     tracker: ProgressTracker,
+    client: httpx.AsyncClient,
 ) -> List[Dict]:
     """
-    Send a batch of pages to the server and collect results.
+    Send a batch of pages to the server and collect results (async, non-blocking).
     
     Args:
         batch: List of (page_number, base64_string, render_time) tuples
         base_url: Base URL of the API server
         tracker: Progress tracker
+        client: Async HTTP client
     
     Returns:
         List of page results
@@ -276,67 +280,66 @@ def send_batch_to_server(
     tracker.update_batches_sent()
     
     try:
-        # Send batch to server
-        response = requests.post(
+        # Send batch to server (async, non-blocking)
+        async with client.stream(
+            "POST",
             f"{base_url}/process-batch-stream",
             json=payload,
-            stream=True,
-            timeout=600,
-        )
-        
-        if response.status_code != 200:
-            console.print(f"[red]Error: {response.status_code}[/red]")
-            console.print(f"[red]Response: {response.text}[/red]")
-            tracker.update_batches_completed()
-            return []
-        
-        # Process SSE stream
-        results = []
-        event_type = None
-        page_count = 0
-        
-        for line in response.iter_lines():
-            if not line:
-                continue
+            timeout=600.0,
+        ) as response:
             
-            line = line.decode('utf-8')
+            if response.status_code != 200:
+                error_text = await response.aread()
+                console.print(f"[red]Error: {response.status_code}[/red]")
+                console.print(f"[red]Response: {error_text.decode('utf-8')}[/red]")
+                tracker.update_batches_completed()
+                return []
             
-            if line.startswith('event:'):
-                event_type = line.split(':', 1)[1].strip()
-            elif line.startswith('data:'):
-                data_str = line.split(':', 1)[1].strip()
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    console.print(f"[yellow]Failed to parse JSON: {data_str[:100]}[/yellow]")
+            # Process SSE stream
+            results = []
+            event_type = None
+            page_count = 0
+            
+            async for line in response.aiter_lines():
+                if not line:
                     continue
                 
-                if event_type == 'page':
-                    page_count += 1
-                    # Debug: Check if OCR text is present
-                    ocr_text = data.get('ocr_text', '')
-                    if not ocr_text:
-                        console.print(f"[yellow]Warning: Page {data.get('page_number')} has empty OCR text[/yellow]")
-                        console.print(f"[yellow]Raw data keys: {list(data.keys())}[/yellow]")
-                    results.append(data)
-                    tracker.update_pages(1)
-                elif event_type == 'complete':
-                    pass
-                elif event_type == 'error':
-                    console.print(f"[red]Batch error: {data.get('error')}[/red]")
-        
-        batch_time = time.time() - batch_start
-        
-        # Debug output
-        if not results:
-            console.print(f"[red]Warning: Batch returned no results![/red]")
-        else:
-            total_chars = sum(len(r.get('ocr_text', '')) for r in results)
-            if total_chars == 0:
-                console.print(f"[yellow]Warning: Batch processed {len(results)} pages but extracted 0 characters[/yellow]")
-        
-        tracker.update_batches_completed()
-        return results
+                if line.startswith('event:'):
+                    event_type = line.split(':', 1)[1].strip()
+                elif line.startswith('data:'):
+                    data_str = line.split(':', 1)[1].strip()
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        console.print(f"[yellow]Failed to parse JSON: {data_str[:100]}[/yellow]")
+                        continue
+                    
+                    if event_type == 'page':
+                        page_count += 1
+                        # Debug: Check if OCR text is present
+                        ocr_text = data.get('ocr_text', '')
+                        if not ocr_text:
+                            console.print(f"[yellow]Warning: Page {data.get('page_number')} has empty OCR text[/yellow]")
+                            console.print(f"[yellow]Raw data keys: {list(data.keys())}[/yellow]")
+                        results.append(data)
+                        tracker.update_pages(1)
+                    elif event_type == 'complete':
+                        pass
+                    elif event_type == 'error':
+                        console.print(f"[red]Batch error: {data.get('error')}[/red]")
+            
+            batch_time = time.time() - batch_start
+            
+            # Debug output
+            if not results:
+                console.print(f"[red]Warning: Batch returned no results![/red]")
+            else:
+                total_chars = sum(len(r.get('ocr_text', '')) for r in results)
+                if total_chars == 0:
+                    console.print(f"[yellow]Warning: Batch processed {len(results)} pages but extracted 0 characters[/yellow]")
+            
+            tracker.update_batches_completed()
+            return results
     
     except Exception as e:
         console.print(f"[red]Exception sending batch: {e}[/red]")
@@ -346,16 +349,17 @@ def send_batch_to_server(
         return []
 
 
-def process_single_pdf(
+async def process_single_pdf_async(
     pdf_path: Path,
     base_url: str,
     dpi: float,
     batch_size: int,
     tracker: ProgressTracker,
     output_dir: Optional[Path] = None,
+    max_batches_in_flight: int = 16,
 ) -> PDFMetrics:
     """
-    Process a single PDF file.
+    Process a single PDF file with async batch sending.
     
     Args:
         pdf_path: Path to PDF file
@@ -364,6 +368,7 @@ def process_single_pdf(
         batch_size: Number of pages per batch
         tracker: Progress tracker
         output_dir: Optional output directory for markdown files
+        max_batches_in_flight: Maximum concurrent batches
     
     Returns:
         PDFMetrics object with timing information
@@ -393,20 +398,39 @@ def process_single_pdf(
         # Step 2: Batch pages
         batches = batch_pages(pages_data, batch_size)
         
-        # Step 3: Send batches to server and collect results
+        # Step 3: Send batches asynchronously with controlled concurrency
         all_results = []
         processing_start = time.time()
         
-        for batch in batches:
-            batch_results = send_batch_to_server(batch, base_url, tracker)
-            all_results.extend(batch_results)
+        # Create async HTTP client
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=10.0),
+            limits=httpx.Limits(max_connections=max_batches_in_flight * 2, max_keepalive_connections=max_batches_in_flight),
+        ) as client:
+            # Create semaphore to limit concurrent batches
+            semaphore = asyncio.Semaphore(max_batches_in_flight)
+            
+            async def send_with_semaphore(batch):
+                async with semaphore:
+                    return await send_batch_to_server(batch, base_url, tracker, client)
+            
+            # Send all batches concurrently (limited by semaphore)
+            tasks = [send_with_semaphore(batch) for batch in batches]
+            batch_results_list = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Collect results
+            for batch_results in batch_results_list:
+                if isinstance(batch_results, Exception):
+                    console.print(f"[red]Batch failed with exception: {batch_results}[/red]")
+                else:
+                    all_results.extend(batch_results)
         
         processing_time = time.time() - processing_start
         metrics.processing_time = processing_time
         
         # Combine OCR results
         all_results.sort(key=lambda x: x['page_number'])
-        ocr_texts = [r['ocr_text'] for r in all_results]
+        ocr_texts = [r.get('ocr_text', '') for r in all_results]
         full_text = "\n\n".join(ocr_texts)
         metrics.ocr_text = full_text
         
@@ -426,7 +450,7 @@ def process_single_pdf(
             
             for idx, result in enumerate(all_results):
                 md_content += f"\n\n## Page {result['page_number']}\n\n"
-                md_content += result['ocr_text']
+                md_content += result.get('ocr_text', '')
             
             with open(md_path, 'w', encoding='utf-8') as f:
                 f.write(md_content)
@@ -438,9 +462,40 @@ def process_single_pdf(
     
     except Exception as e:
         console.print(f"[red]Error processing {pdf_path.name}: {e}[/red]")
+        import traceback
+        traceback.print_exc()
         metrics.end_time = time.time()
         metrics.total_time = metrics.end_time - metrics.start_time
         return metrics
+
+
+def process_single_pdf(
+    pdf_path: Path,
+    base_url: str,
+    dpi: float,
+    batch_size: int,
+    tracker: ProgressTracker,
+    output_dir: Optional[Path] = None,
+    max_batches_in_flight: int = 16,
+) -> PDFMetrics:
+    """
+    Process a single PDF file (sync wrapper for async function).
+    
+    Args:
+        pdf_path: Path to PDF file
+        base_url: Base URL of API server
+        dpi: DPI for rendering
+        batch_size: Number of pages per batch
+        tracker: Progress tracker
+        output_dir: Optional output directory for markdown files
+        max_batches_in_flight: Maximum concurrent batches
+    
+    Returns:
+        PDFMetrics object with timing information
+    """
+    return asyncio.run(process_single_pdf_async(
+        pdf_path, base_url, dpi, batch_size, tracker, output_dir, max_batches_in_flight
+    ))
 
 
 def generate_performance_chart(metrics: GlobalMetrics, output_path: Path):
@@ -604,6 +659,7 @@ def process_directory(
     batch_size: int = 32,
     output_dir: Optional[Path] = None,
     max_workers: int = 4,
+    max_batches_in_flight: int = 16,
 ):
     """
     Process all PDF files in a directory with concurrent processing.
@@ -615,6 +671,7 @@ def process_directory(
         batch_size: Number of pages per batch
         output_dir: Directory to save markdown outputs
         max_workers: Maximum number of concurrent PDF processing threads
+        max_batches_in_flight: Maximum concurrent batches per PDF
     """
     # Find all PDF files
     pdf_files = sorted([f for f in directory.iterdir() if f.is_file() and f.suffix.lower() == '.pdf'])
@@ -631,6 +688,7 @@ def process_directory(
         total_pdfs=len(pdf_files),
         total_bytes=total_bytes,
         start_time=time.time(),
+        max_batches_in_flight=max_batches_in_flight,
     )
     
     tracker = ProgressTracker(global_metrics)
@@ -640,6 +698,7 @@ def process_directory(
     console.print(f"  Total size: {total_bytes:,} bytes")
     console.print(f"  Batch size: {batch_size} pages")
     console.print(f"  Max concurrent PDFs: {max_workers}")
+    console.print(f"  Max batches in flight per PDF: {max_batches_in_flight}")
     console.print(f"  DPI: {dpi}")
     console.print()
     
@@ -670,7 +729,8 @@ def process_directory(
                     dpi,
                     batch_size,
                     tracker,
-                    output_dir
+                    output_dir,
+                    max_batches_in_flight
                 ): pdf
                 for pdf in pdf_files
             }
@@ -697,27 +757,36 @@ def process_directory(
                     progress.console.print(f"[red]✗ {pdf.name}: {e}[/red]")
                     progress.update(pdf_task, advance=1)
     
+    # Finalize capacity tracking
+    tracker.finalize_capacity_tracking()
+    
     # Print summary report
     print_summary_report(global_metrics, output_dir)
 
 
-def test_health_check(base_url: str):
-    """Test the health check endpoint."""
+async def test_health_check_async(base_url: str):
+    """Test the health check endpoint (async)."""
     console.print("\n[bold]Testing health check...[/bold]")
     try:
-        response = requests.get(f"{base_url}/", timeout=5)
-        if response.status_code == 200:
-            data = response.json()
-            console.print(f"[green]✓[/green] Server is healthy")
-            console.print(f"  Status: {data.get('status')}")
-            console.print(f"  Models loaded: {data.get('models_loaded')}")
-        else:
-            console.print(f"[red]✗[/red] Server returned status {response.status_code}")
-            sys.exit(1)
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{base_url}/")
+            if response.status_code == 200:
+                data = response.json()
+                console.print(f"[green]✓[/green] Server is healthy")
+                console.print(f"  Status: {data.get('status')}")
+                console.print(f"  Models loaded: {data.get('models_loaded')}")
+            else:
+                console.print(f"[red]✗[/red] Server returned status {response.status_code}")
+                sys.exit(1)
     except Exception as e:
         console.print(f"[red]✗[/red] Health check failed: {e}")
         sys.exit(1)
     console.print()
+
+
+def test_health_check(base_url: str):
+    """Test the health check endpoint (sync wrapper)."""
+    asyncio.run(test_health_check_async(base_url))
 
 
 def main():
@@ -726,17 +795,18 @@ def main():
         console.print("[bold]Usage:[/bold]")
         console.print("  python test_client.py <pdf_file_or_directory> [options]")
         console.print("\n[bold]Options:[/bold]")
-        console.print("  --output-dir <dir>   Directory to save markdown files (default: ./output)")
-        console.print("  --dpi <dpi>          DPI for PDF rendering (default: 150.0)")
-        console.print("  --batch-size <n>     Pages per batch (default: 32)")
-        console.print("  --workers <n>        Max concurrent PDFs (default: 4)")
-        console.print("  --url <url>          Base URL of API server (default: http://localhost:7670)")
+        console.print("  --output-dir <dir>          Directory to save markdown files (default: ./output)")
+        console.print("  --dpi <dpi>                 DPI for PDF rendering (default: 150.0)")
+        console.print("  --batch-size <n>            Pages per batch (default: 32)")
+        console.print("  --workers <n>               Max concurrent PDFs (default: 4)")
+        console.print("  --max-batches-in-flight <n> Max concurrent batches per PDF (default: 16)")
+        console.print("  --url <url>                 Base URL of API server (default: http://localhost:7670)")
         console.print("\n[bold]Examples:[/bold]")
         console.print("  # Process a single PDF")
         console.print("  python test_client.py document.pdf --output-dir ./output")
         console.print()
-        console.print("  # Process all PDFs in a directory")
-        console.print("  python test_client.py ./pdfs/ --output-dir ./output --workers 8")
+        console.print("  # Process all PDFs in a directory with high concurrency")
+        console.print("  python test_client.py ./pdfs/ --output-dir ./output --workers 8 --max-batches-in-flight 32")
         sys.exit(1)
     
     # Parse arguments
@@ -746,6 +816,7 @@ def main():
     dpi = 150.0
     batch_size = 32
     max_workers = 4
+    max_batches_in_flight = 16
     
     i = 2
     while i < len(sys.argv):
@@ -760,6 +831,9 @@ def main():
             i += 2
         elif sys.argv[i] == '--workers' and i + 1 < len(sys.argv):
             max_workers = int(sys.argv[i + 1])
+            i += 2
+        elif sys.argv[i] == '--max-batches-in-flight' and i + 1 < len(sys.argv):
+            max_batches_in_flight = int(sys.argv[i + 1])
             i += 2
         elif sys.argv[i] == '--url' and i + 1 < len(sys.argv):
             base_url = sys.argv[i + 1].rstrip("/")
@@ -786,6 +860,7 @@ def main():
             total_pdfs=1,
             total_bytes=input_path.stat().st_size,
             start_time=time.time(),
+            max_batches_in_flight=max_batches_in_flight,
         )
         tracker = ProgressTracker(global_metrics)
         
@@ -796,12 +871,14 @@ def main():
             batch_size,
             tracker,
             output_dir,
+            max_batches_in_flight,
         )
         tracker.add_pdf_metrics(pdf_metrics)
+        tracker.finalize_capacity_tracking()
         print_summary_report(global_metrics, output_dir)
     
     elif input_path.is_dir():
-        process_directory(input_path, base_url, dpi, batch_size, output_dir, max_workers)
+        process_directory(input_path, base_url, dpi, batch_size, output_dir, max_workers, max_batches_in_flight)
     
     else:
         console.print(f"[red]Error: Invalid input path: {input_path}[/red]")

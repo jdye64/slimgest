@@ -9,12 +9,13 @@ Usage:
     python batch_processing_example.py <directory> --output-dir ./output --batch-size 32
 """
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict
 import sys
 import time
 import argparse
 import io
 import base64
+import asyncio
 
 # Add parent directory to path to import from src
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -33,6 +34,7 @@ from slimgest.web.test_client import (
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from PIL import Image as PILImage
+import httpx
 
 
 def render_image_to_base64(
@@ -63,7 +65,7 @@ def render_image_to_base64(
     return (1, base64_str, load_time)
 
 
-def process_single_file_concurrent(
+async def process_single_file_concurrent_async(
     file_path: Path,
     base_url: str,
     dpi: float,
@@ -73,7 +75,7 @@ def process_single_file_concurrent(
     max_batches_in_flight: int = 16,
 ) -> PDFMetrics:
     """
-    Process a single file (PDF, JPEG, or PNG) with concurrent batch sending.
+    Process a single file (PDF, JPEG, or PNG) with async concurrent batch sending.
     
     Args:
         file_path: Path to file (PDF, JPEG, or PNG)
@@ -131,26 +133,35 @@ def process_single_file_concurrent(
         print(f"  Loaded {len(pages_data)} page(s) from {file_type} in {render_time:.2f}s ({render_pps:.2f} pages/s)")
         print(f"  Created {len(batches)} batch(es) (max {max_batches_in_flight} concurrent)")
         
-        # Step 3: Send batches concurrently and collect results
+        # Step 3: Send batches asynchronously with controlled concurrency
         all_results = []
         processing_start = time.time()
         
-        with ThreadPoolExecutor(max_workers=max_batches_in_flight) as executor:
-            # Submit all batches
-            future_to_batch = {
-                executor.submit(send_batch_to_server, batch, base_url, tracker): batch_idx
-                for batch_idx, batch in enumerate(batches)
-            }
+        # Create async HTTP client
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(600.0, connect=10.0),
+            limits=httpx.Limits(max_connections=max_batches_in_flight * 2, max_keepalive_connections=max_batches_in_flight),
+        ) as client:
+            # Create semaphore to limit concurrent batches
+            semaphore = asyncio.Semaphore(max_batches_in_flight)
             
-            # Collect results as they complete
-            for future in as_completed(future_to_batch):
-                batch_idx = future_to_batch[future]
-                try:
-                    batch_results = future.result()
+            async def send_with_semaphore(batch, batch_idx):
+                async with semaphore:
+                    results = await send_batch_to_server(batch, base_url, tracker, client)
+                    return (batch_idx, results)
+            
+            # Send all batches concurrently (limited by semaphore)
+            tasks = [send_with_semaphore(batch, idx) for idx, batch in enumerate(batches)]
+            batch_results_list = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Collect results
+            for result in batch_results_list:
+                if isinstance(result, Exception):
+                    print(f"    Batch failed with exception: {result}")
+                else:
+                    batch_idx, batch_results = result
                     all_results.extend(batch_results)
                     print(f"    Batch {batch_idx + 1}/{len(batches)} completed: {len(batch_results)} pages")
-                except Exception as e:
-                    print(f"    Batch {batch_idx + 1} failed: {e}")
         
         processing_time = time.time() - processing_start
         metrics.processing_time = processing_time
@@ -212,6 +223,35 @@ def process_single_file_concurrent(
         metrics.end_time = time.time()
         metrics.total_time = metrics.end_time - metrics.start_time
         return metrics
+
+
+def process_single_file_concurrent(
+    file_path: Path,
+    base_url: str,
+    dpi: float,
+    batch_size: int,
+    tracker: ProgressTracker,
+    output_dir: Optional[Path] = None,
+    max_batches_in_flight: int = 16,
+) -> PDFMetrics:
+    """
+    Process a single file (PDF, JPEG, or PNG) with concurrent batch sending (sync wrapper).
+    
+    Args:
+        file_path: Path to file (PDF, JPEG, or PNG)
+        base_url: Base URL of API server
+        dpi: DPI for PDF rendering (ignored for images)
+        batch_size: Number of pages per batch
+        tracker: Progress tracker
+        output_dir: Optional output directory for markdown files
+        max_batches_in_flight: Maximum number of batches to send concurrently
+    
+    Returns:
+        PDFMetrics object with timing information
+    """
+    return asyncio.run(process_single_file_concurrent_async(
+        file_path, base_url, dpi, batch_size, tracker, output_dir, max_batches_in_flight
+    ))
 
 
 def process_files_from_directory(

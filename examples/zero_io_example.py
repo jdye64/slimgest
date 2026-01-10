@@ -5,7 +5,7 @@ Zero-IO batch processing example - pre-loads all images into memory before proce
 This script demonstrates maximum throughput by eliminating I/O bottlenecks:
 1. Loads ALL images from directory into memory first
 2. Creates batches of 32 images
-3. Sends batches concurrently to REST service
+3. Sends batches concurrently to REST service using async HTTP
 4. Measures time spent at max capacity to evaluate server throughput
 
 Usage:
@@ -15,14 +15,15 @@ Usage:
 """
 
 import argparse
+import asyncio
 import base64
 import io
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Tuple
 
+import httpx
 from PIL import Image as PILImage
 
 # Add parent directory to path to import from src
@@ -109,14 +110,14 @@ def preload_all_images(image_dir: Path, supported_extensions: List[str]) -> Tupl
     return loaded_images, total_load_time
 
 
-def process_preloaded_images(
+async def process_preloaded_images_async(
     preloaded_images: List[Tuple[int, str, float]],
     base_url: str,
     batch_size: int,
     max_batches_in_flight: int,
 ) -> GlobalMetrics:
     """
-    Process pre-loaded images with concurrent batch sending.
+    Process pre-loaded images with async concurrent batch sending.
     
     This eliminates I/O bottlenecks and measures pure processing throughput.
     
@@ -153,7 +154,7 @@ def process_preloaded_images(
     print(f"  Max concurrent batches: {max_batches_in_flight}")
     print(f"{'='*80}\n")
     
-    # Send batches concurrently
+    # Send batches asynchronously
     print(f"{'='*80}")
     print(f"PROCESSING PHASE: Sending batches to {base_url}")
     print(f"{'='*80}")
@@ -161,21 +162,29 @@ def process_preloaded_images(
     all_results = []
     processing_start = time.time()
     
-    with ThreadPoolExecutor(max_workers=max_batches_in_flight) as executor:
-        # Submit all batches
-        future_to_batch = {
-            executor.submit(send_batch_to_server, batch, base_url, tracker): batch_idx
-            for batch_idx, batch in enumerate(batches)
-        }
+    # Create async HTTP client
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(600.0, connect=10.0),
+        limits=httpx.Limits(max_connections=max_batches_in_flight * 2, max_keepalive_connections=max_batches_in_flight),
+    ) as client:
+        # Create semaphore to limit concurrent batches
+        semaphore = asyncio.Semaphore(max_batches_in_flight)
         
-        print(f"Submitted {len(batches)} batches to executor...")
+        async def send_with_semaphore(batch, batch_idx):
+            async with semaphore:
+                results = await send_batch_to_server(batch, base_url, tracker, client)
+                return (batch_idx, results)
         
-        # Collect results as they complete
+        print(f"Submitting {len(batches)} batches to async executor...")
+        
+        # Send all batches concurrently (limited by semaphore)
+        tasks = [send_with_semaphore(batch, idx) for idx, batch in enumerate(batches)]
+        
+        # Process results as they complete
         completed = 0
-        for future in as_completed(future_to_batch):
-            batch_idx = future_to_batch[future]
+        for coro in asyncio.as_completed(tasks):
             try:
-                batch_results = future.result()
+                batch_idx, batch_results = await coro
                 all_results.extend(batch_results)
                 completed += 1
                 
@@ -191,7 +200,8 @@ def process_preloaded_images(
                       end='\r')
                 
             except Exception as e:
-                print(f"\n  ✗ Batch {batch_idx + 1} failed: {e}")
+                completed += 1
+                print(f"\n  ✗ Batch failed with exception: {e}")
     
     processing_time = time.time() - processing_start
     
@@ -217,6 +227,31 @@ def process_preloaded_images(
         print(f"  ✓ OCR extraction successful")
     
     return global_metrics
+
+
+def process_preloaded_images(
+    preloaded_images: List[Tuple[int, str, float]],
+    base_url: str,
+    batch_size: int,
+    max_batches_in_flight: int,
+) -> GlobalMetrics:
+    """
+    Process pre-loaded images with concurrent batch sending (sync wrapper).
+    
+    This eliminates I/O bottlenecks and measures pure processing throughput.
+    
+    Args:
+        preloaded_images: List of (page_number, base64_string, load_time) tuples
+        base_url: Base URL of API server
+        batch_size: Number of images per batch
+        max_batches_in_flight: Maximum number of batches to send concurrently
+    
+    Returns:
+        GlobalMetrics object with performance statistics
+    """
+    return asyncio.run(process_preloaded_images_async(
+        preloaded_images, base_url, batch_size, max_batches_in_flight
+    ))
 
 
 def print_performance_analysis(metrics: GlobalMetrics, preload_time: float):
