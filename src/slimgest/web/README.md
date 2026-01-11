@@ -1,29 +1,73 @@
-# Slim-Gest FastAPI Server
+# Slim-Gest Web Service
 
-This module provides a FastAPI server for processing PDF files using the slim-gest OCR pipeline.
+FastAPI-based web service for PDF processing using the Slim-Gest pipeline with multiprocessing workers for concurrent request handling.
 
-## Features
+## Architecture
 
-- **Single PDF Processing**: Process one PDF at a time
-- **Batch Processing**: Process multiple PDFs in a single request
-- **🆕 Streaming Processing**: Stream page results as they're processed using Server-Sent Events (SSE)
-- **GPU Acceleration**: Utilizes GPU models for fast processing
-- **Automatic Model Loading**: Models are loaded once on startup
-- **Concurrent Processing**: Support for concurrent requests
+The service uses a multiprocessing architecture to handle concurrent requests efficiently:
 
-## Running the Server
-
-### Using Python Module
-
-```bash
-python -m slimgest.web --host 0.0.0.0 --port 8000
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      FastAPI Server                         │
+│  - Receives HTTP requests                                   │
+│  - Creates jobs and manages job lifecycle                   │
+│  - Non-blocking request handling                            │
+└─────────────────┬───────────────────────────────────────────┘
+                  │
+                  ├─► Request Queue (IPC)
+                  │
+    ┌─────────────┴──────────────┬──────────────┬─────────────┐
+    │                            │              │             │
+    ▼                            ▼              ▼             ▼
+┌─────────┐                ┌─────────┐    ┌─────────┐   ┌─────────┐
+│ Worker 0│                │ Worker 1│    │ Worker 2│   │ Worker N│
+│  - GPU  │                │  - GPU  │    │  - GPU  │   │  - GPU  │
+│  - OCR  │                │  - OCR  │    │  - OCR  │   │  - OCR  │
+│ Models  │                │ Models  │    │ Models  │   │ Models  │
+└────┬────┘                └────┬────┘    └────┬────┘   └────┬────┘
+     │                          │              │             │
+     └──────────────┬───────────┴──────────────┴─────────────┘
+                    │
+                    ▼
+              Result Queue (IPC)
+                    │
+                    ▼
+          ┌─────────────────────┐
+          │  Result Processor   │
+          │  - Updates jobs     │
+          │  - Streams events   │
+          └─────────────────────┘
 ```
 
-### Using uvicorn directly
+### Key Components
 
-```bash
-uvicorn slimgest.web.__main__:app --host 0.0.0.0 --port 8000
-```
+1. **FastAPI Server** (`__main__.py`):
+   - Handles HTTP requests asynchronously
+   - Manages job lifecycle and state
+   - Submits work to worker processes via IPC queues
+   - Returns immediately without blocking on processing
+
+2. **Worker Processes** (`worker.py`):
+   - Each worker loads its own copy of the ML models
+   - Processes PDFs independently
+   - Communicates results back via result queue
+   - Supports batch and streaming processing modes
+
+3. **Job Manager** (`job_manager.py`):
+   - Tracks job state and results
+   - Provides async interfaces for job status queries
+   - Manages streaming event queues for SSE endpoints
+
+4. **IPC Queues**:
+   - `request_queue`: FastAPI → Workers (job requests)
+   - `result_queue`: Workers → FastAPI (processing results)
+
+## Configuration
+
+Environment variables:
+
+- `SLIMGEST_NUM_WORKERS`: Number of worker processes (default: 2)
+- `NEMOTRON_OCR_MODEL_DIR`: Path to OCR model directory
 
 ## API Endpoints
 
@@ -33,207 +77,114 @@ uvicorn slimgest.web.__main__:app --host 0.0.0.0 --port 8000
 GET /
 ```
 
-Returns server status and whether models are loaded.
+Returns service status and worker information.
 
-**Example:**
-```bash
-curl http://localhost:8000/
-```
-
-### Process Single PDF
+### Process PDF (Batch)
 
 ```bash
 POST /process-pdf
-```
-
-**Parameters:**
-- `file`: PDF file (multipart/form-data)
-- `dpi`: DPI for rendering (optional, default: 150.0)
-
-**Example:**
-```bash
-curl -X POST http://localhost:8000/process-pdf \
-  -F "file=@document.pdf" \
-  -F "dpi=150"
-```
-
-### Process Multiple PDFs
-
-```bash
 POST /process-pdfs
 ```
 
-**Parameters:**
-- `files`: List of PDF files (multipart/form-data)
-- `dpi`: DPI for rendering (optional, default: 150.0)
-
-**Example:**
-```bash
-curl -X POST http://localhost:8000/process-pdfs \
-  -F "files=@document1.pdf" \
-  -F "files=@document2.pdf" \
-  -F "dpi=150"
-```
-
-### 🆕 Process PDF with Streaming (SSE)
-
-```bash
-POST /process-pdf-stream
-```
-
-This endpoint uses Server-Sent Events (SSE) to stream results as each page is processed, allowing real-time progress monitoring.
+Process one or more PDFs and return complete results. The server waits for processing to complete before returning.
 
 **Parameters:**
-- `file`: PDF file (multipart/form-data)
-- `dpi`: DPI for rendering (optional, default: 150.0)
+- `file` or `files`: PDF file(s) to process
+- `dpi`: Resolution for PDF rendering (default: 150.0)
 
-**SSE Events:**
-- `start`: Processing has begun
-- `page`: A page has been processed (includes page number and text)
-- `complete`: All pages processed (includes full results)
-- `error`: An error occurred
-
-**Example (curl):**
-```bash
-curl -N -X POST http://localhost:8000/process-pdf-stream \
-  -F "file=@document.pdf" \
-  -F "dpi=150"
-```
-
-**Example Output:**
-```
-event: start
-data: {"status": "processing", "pdf": "document.pdf"}
-
-event: page
-data: {"page_number": 1, "page_text": "Text from page 1...", "total_pages_so_far": 1}
-
-event: page
-data: {"page_number": 2, "page_text": "Text from page 2...", "total_pages_so_far": 2}
-
-event: complete
-data: {"status": "complete", "total_pages": 2, "pages": [...], "pdf_name": "document.pdf"}
-```
-
-## Response Format
-
-The API returns a JSON response with the following structure:
-
+**Response:**
 ```json
 {
-  "total_pages_processed": 5,
-  "total_pdfs": 1,
-  "elapsed_seconds": 12.34,
-  "results": [
+  "pdfs": [
     {
-      "pdf_path": "/tmp/slimgest_xyz/document.pdf",
-      "pages_processed": 5,
-      "ocr_text": "Full extracted text from all pages...",
-      "raw_ocr_results": [
-        "page 1 text...",
-        "page 2 text...",
-        ...
-      ]
+      "filename": "document.pdf",
+      "pages": [...],
+      ...
     }
   ]
 }
 ```
 
-## Test Client
-
-A test client is provided that supports SSE streaming, directory processing, and automatic markdown generation.
-
-### Single PDF Processing
+### Process PDF (Streaming)
 
 ```bash
-python -m slimgest.web.test_client document.pdf --output-dir ./output
+POST /process-pdf-stream
 ```
 
-### Directory Processing (Concurrent)
+Process a PDF and stream results as Server-Sent Events. Results are sent as each page is processed.
 
-Process all PDFs in a directory with concurrent requests (16 concurrent by default):
+**Parameters:**
+- `file`: PDF file to process
+- `dpi`: Resolution for PDF rendering (default: 150.0)
+
+**Response:** Server-Sent Events stream
+
+**Events:**
+- `start`: Processing has begun
+- `page`: A page has been processed
+- `complete`: All pages processed
+- `error`: An error occurred
+
+### Check Job Status
 
 ```bash
-python -m slimgest.web.test_client ./pdfs/ --output-dir ./output
+GET /jobs/{job_id}
 ```
 
-Adjust concurrency level:
+Get the status of a specific job.
+
+**Response:**
+```json
+{
+  "job_id": "uuid",
+  "status": "completed",
+  "created_at": "2026-01-10T...",
+  "completed_at": "2026-01-10T...",
+  "has_result": true,
+  "error": null
+}
+```
+
+## Running the Service
+
+### Start the server
 
 ```bash
-python -m slimgest.web.test_client ./pdfs/ --output-dir ./output --workers 32
+# Using the module directly
+python -m slimgest.web
+
+# Or with custom settings
+SLIMGEST_NUM_WORKERS=4 python -m slimgest.web --port 8000 --host 0.0.0.0
 ```
 
-### Options
+### Using the example client
 
-- `--output-dir <dir>`: Directory to save markdown files (default: ./output)
-- `--dpi <dpi>`: DPI for PDF rendering (default: 150.0)
-- `--workers <n>`: Max concurrent requests for directory processing (default: 16)
-
-### Features
-
-- **Real-time Progress**: See each page as it's processed
-- **Concurrent Processing**: Process multiple PDFs simultaneously
-- **Automatic Markdown Generation**: Saves OCR results as formatted markdown files
-- **Error Handling**: Gracefully handles errors and continues processing
-
-## Python Client Example
-
-### Standard JSON Response
-
-```python
-import requests
-
-# Process a single PDF
-with open("document.pdf", "rb") as f:
-    files = {"file": f}
-    response = requests.post("http://localhost:8000/process-pdf", files=files)
-    result = response.json()
-    print(result["results"][0]["ocr_text"])
+```bash
+python -m slimgest.web.example_client /path/to/document.pdf
 ```
 
-### Streaming SSE Response
+## Benefits of Multiprocessing Architecture
 
-```python
-import requests
-import json
+1. **Non-blocking**: FastAPI server never blocks on heavy processing
+2. **Concurrent**: Multiple requests can be processed simultaneously
+3. **Scalable**: Add more workers to handle more load
+4. **Isolated**: Each worker has its own GPU memory and model instances
+5. **Resilient**: Worker crashes don't affect the server or other workers
+6. **Fair**: Request queue ensures FIFO processing
 
-with open("document.pdf", "rb") as f:
-    files = {"file": ("document.pdf", f, "application/pdf")}
-    response = requests.post(
-        "http://localhost:8000/process-pdf-stream",
-        files=files,
-        stream=True
-    )
-    
-    for line in response.iter_lines():
-        if not line:
-            continue
-        line = line.decode('utf-8')
-        
-        if line.startswith('event:'):
-            event_type = line.split(':', 1)[1].strip()
-        elif line.startswith('data:'):
-            data = json.loads(line.split(':', 1)[1].strip())
-            
-            if event_type == 'page':
-                print(f"Page {data['page_number']}: {data['page_text'][:100]}...")
-            elif event_type == 'complete':
-                print(f"Complete! Total pages: {data['total_pages']}")
-```
+## Performance Considerations
 
-## Configuration
-
-The server currently uses a hardcoded path for the OCR model checkpoints:
-```
-/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints
-```
-
-You may need to update this path in `__main__.py` to match your installation.
+- **Workers per GPU**: Typically 1-2 workers per GPU to avoid memory issues
+- **Queue size**: Limited to 100 pending requests to prevent memory exhaustion
+- **Timeouts**: Batch requests have a 10-minute timeout
+- **Cleanup**: Background tasks handle temporary file cleanup
 
 ## Development
 
-### Interactive API Documentation
+Run with auto-reload:
 
-Once the server is running, you can access:
-- Swagger UI: http://localhost:8000/docs
-- ReDoc: http://localhost:8000/redoc
+```bash
+uvicorn slimgest.web.__main__:app --reload --port 8000
+```
+
+Note: Auto-reload may not work well with multiprocessing. For development, consider using `workers=1`.

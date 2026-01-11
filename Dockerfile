@@ -23,10 +23,6 @@ ENV PATH="/root/.local/bin:/root/.cargo/bin:${PATH}"
 
 WORKDIR /app
 
-# Copy project files first to leverage Docker layer caching
-COPY pyproject.toml README.md /app/
-COPY src /app/src
-
 # Copy nemotron-ocr wheel for installation
 COPY models/nemotron-ocr-v1/nemotron-ocr/dist/nemotron_ocr-1.0.0-py3-none-any.whl /tmp/
 COPY models/nemotron-ocr-v1/checkpoints /app/models/nemotron-ocr-v1/checkpoints
@@ -47,6 +43,10 @@ RUN /root/.local/bin/uv pip install torch torchvision --index-url https://downlo
 RUN /root/.local/bin/uv pip install /tmp/nemotron_ocr-1.0.0-py3-none-any.whl \
   --index-url https://download.pytorch.org/whl/cu128 \
   --extra-index-url https://pypi.org/simple
+
+# Copy project files first to leverage Docker layer caching
+COPY pyproject.toml README.md /app/
+COPY src /app/src
 
 # Install project dependencies with UV pip
 RUN /root/.local/bin/uv pip install . \
