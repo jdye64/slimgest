@@ -13,6 +13,10 @@ import numpy as np
 import mimetypes
 from collections import defaultdict
 import threading
+import queue
+import sys
+import subprocess
+from datetime import datetime
 
 from nemotron_page_elements_v3.model import define_model as define_model_page_elements
 from nemotron_page_elements_v3.model import resize_pad as resize_pad_page_elements
@@ -32,6 +36,22 @@ from slimgest.pdf.tensor_ops import crop_tensor_with_bbox
 app = typer.Typer(help="In-memory batch pipeline with batched page/image processing and detailed performance breakdown")
 install(show_locals=False)
 console = Console()
+
+def get_git_sha():
+    """Get the current git commit SHA, or 'unknown' if not in a git repo."""
+    try:
+        sha = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], 
+                                      stderr=subprocess.DEVNULL).decode('ascii').strip()
+        return sha
+    except:
+        return 'unknown'
+
+def get_log_filename():
+    """Generate log filename in format YYYY-MM-DD-HH-MM-SS-git-sha.log"""
+    now = datetime.now()
+    timestamp = now.strftime("%Y-%m-%d-%H-%M-%S")
+    git_sha = get_git_sha()
+    return f"{timestamp}-{git_sha}.log"
 
 
 def tensor_to_pil_image(tensor):
@@ -116,80 +136,53 @@ def process_batch_bitmaps(
             "page_number": page.get("page_number"),
         })
     
-    # STEP 2: Run Page Elements and OCR in PARALLEL using threading
-    page_elements_results = [None]
-    ocr_results = [None]
+    # STEP 2: Run Page Elements detection (sequential to avoid CUDA threading issues)
+    t0_pe = time.perf_counter()
+    with torch.inference_mode():
+        # Resize and pad all tensors
+        resized_tensors = []
+        for tensor, shape in zip(batch_tensors, batch_shapes):
+            resized = resize_pad_page_elements(tensor, page_elements_input_shape)
+            resized_tensors.append(resized)
+        
+        # Batch process all pages through page elements model
+        all_preds = []
+        with torch.cuda.device(device):
+            for resized_tensor, bitmap_shape in zip(resized_tensors, batch_shapes):
+                preds = page_elements_model(resized_tensor, bitmap_shape)[0]
+                all_preds.append(preds)
     
-    def run_page_elements():
-        """Run page elements detection on entire batch"""
-        t0 = time.perf_counter()
-        with torch.inference_mode():
-            # Resize and pad all tensors
-            resized_tensors = []
-            for tensor, shape in zip(batch_tensors, batch_shapes):
-                resized = resize_pad_page_elements(tensor, page_elements_input_shape)
-                resized_tensors.append(resized)
-            
-            # Batch process all pages through page elements model
-            all_preds = []
-            with torch.cuda.device(device):
-                for resized_tensor, bitmap_shape in zip(resized_tensors, batch_shapes):
-                    preds = page_elements_model(resized_tensor, bitmap_shape)[0]
-                    all_preds.append(preds)
-            
-            page_elements_results[0] = {
-                'preds': all_preds,
-                'resized_tensors': resized_tensors,
-                'time': time.perf_counter() - t0
-            }
-    
-    def run_ocr():
-        """Run OCR on all pages"""
-        t0 = time.perf_counter()
-        all_ocr_results = []
-        for tensor in batch_tensors:
-            ocr_preds = ocr_model(tensor)
-            ocr_page_results = []
-            ocr_page_raw = []
-            for pred in ocr_preds:
-                ocr_page_results.append(str(pred['text']))
-                ocr_page_raw.append(str(pred))
-            all_ocr_results.append({
-                'text': " ".join(ocr_page_results),
-                'raw': ocr_page_raw
-            })
-        ocr_results[0] = {
-            'results': all_ocr_results,
-            'time': time.perf_counter() - t0
-        }
-    
-    # Launch both in parallel
-    pe_thread = threading.Thread(target=run_page_elements)
-    ocr_thread = threading.Thread(target=run_ocr)
-    
-    pe_thread.start()
-    ocr_thread.start()
-    
-    pe_thread.join()
-    ocr_thread.join()
-    
-    # Extract results
-    page_elements_data = page_elements_results[0]
-    ocr_data = ocr_results[0]
-    
-    page_elements_times.append(page_elements_data['time'])
-    ocr_times.extend([ocr_data['time'] / len(batch)] * len(batch))  # Distribute time across pages
+    page_elements_time = time.perf_counter() - t0_pe
+    page_elements_times.append(page_elements_time)
     pe_invocations += len(batch)
+    
+    # STEP 3: Run OCR on all pages (sequential to avoid CUDA threading issues)
+    t0_ocr = time.perf_counter()
+    all_ocr_results = []
+    for tensor in batch_tensors:
+        ocr_preds = ocr_model(tensor)
+        ocr_page_results = []
+        ocr_page_raw = []
+        for pred in ocr_preds:
+            ocr_page_results.append(str(pred['text']))
+            ocr_page_raw.append(str(pred))
+        all_ocr_results.append({
+            'text': " ".join(ocr_page_results),
+            'raw': ocr_page_raw
+        })
+    
+    ocr_time = time.perf_counter() - t0_ocr
+    ocr_times.extend([ocr_time / len(batch)] * len(batch))  # Distribute time across pages
     ocr_invocations += len(batch)
     
-    # STEP 3: Postprocess page elements and collect all crops
+    # STEP 4: Postprocess page elements and collect all crops
     t_postproc = time.perf_counter()
     all_table_crops = []
     all_graphic_crops = []
     page_element_metadata = []  # Track which page each element belongs to
     
     for idx, (preds, resized_tensor, bitmap_shape) in enumerate(
-        zip(page_elements_data['preds'], page_elements_data['resized_tensors'], batch_shapes)
+        zip(all_preds, resized_tensors, batch_shapes)
     ):
         boxes, labels, scores = postprocess_preds_page_element(
             preds, page_elements_model.thresholds_per_class, page_elements_model.labels
@@ -220,7 +213,7 @@ def process_batch_bitmaps(
     postproc_elapsed = time.perf_counter() - t_postproc
     postprocess_times.append(postproc_elapsed)
     
-    # STEP 4: Batch process table structures
+    # STEP 5: Batch process table structures
     t_table = time.perf_counter()
     table_results_by_page = [[] for _ in range(len(batch))]
     
@@ -237,7 +230,7 @@ def process_batch_bitmaps(
     table_elapsed = time.perf_counter() - t_table
     table_structure_times.append(table_elapsed)
     
-    # STEP 5: Batch process graphic elements
+    # STEP 6: Batch process graphic elements
     t_graphics = time.perf_counter()
     graphic_results_by_page = [[] for _ in range(len(batch))]
     
@@ -254,10 +247,10 @@ def process_batch_bitmaps(
     graphics_elapsed = time.perf_counter() - t_graphics
     graphic_elements_times.append(graphics_elapsed)
     
-    # STEP 6: Assemble final results
+    # STEP 7: Assemble final results
     results = []
     for idx, metadata in enumerate(batch_metadata):
-        ocr_result = ocr_data['results'][idx]
+        ocr_result = all_ocr_results[idx]
         result = {
             "input_id": metadata["input_id"],
             "pdf_path": metadata["pdf_path"],
@@ -271,11 +264,11 @@ def process_batch_bitmaps(
         
         if timings is not None:
             timings_per_page = {
-                "page_elements": page_elements_data['time'] / len(batch),
+                "page_elements": page_elements_time / len(batch),
                 "page_elements_postproc": postproc_elapsed / len(batch),
                 "table_structure": table_elapsed / len(batch) if all_table_crops else 0,
                 "graphic_elements": graphics_elapsed / len(batch) if all_graphic_crops else 0,
-                "ocr": ocr_data['time'] / len(batch),
+                "ocr": ocr_time / len(batch),
             }
             timings["per_page"].append(timings_per_page)
 
@@ -297,6 +290,58 @@ def process_batch_bitmaps(
 
     return results
 
+def iter_documents_and_pages(input_dir: Path, dpi: float = 150):
+    """
+    Generator that yields documents (PDFs and images) one at a time.
+    For PDFs, yields all pages of that PDF together.
+    For images, yields the single image.
+    
+    Yields:
+        Tuple of (file_path, pages_data) where pages_data is a list of page info dicts
+    """
+    import mimetypes
+    from PIL import Image
+
+    files = sorted([Path(f) for f in input_dir.iterdir() if f.is_file()])
+    
+    for f in files:
+        mime, _ = mimetypes.guess_type(str(f))
+        ext = f.suffix.lower()
+        
+        if mime == "application/pdf" or ext == ".pdf":
+            # PDF: yield all pages together
+            pages = []
+            # Use CPU as temporary device for loading, will be moved to target GPU later
+            for page_info in iter_pdf_page_tensors(str(f), dpi=dpi, device=['cpu']):
+                pages.append({
+                    "input_id": f"{f.name}__page_{page_info.page_number}",
+                    "pdf_path": str(f),
+                    "page_number": page_info.page_number,
+                    "tensor": page_info.tensor.detach().clone().float(),  # shape [3,H,W]
+                    "device": None,  # Will be assigned by loader
+                })
+            if pages:
+                yield (f, pages)
+                
+        elif ext in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
+            # Image file: yield single image
+            try:
+                pil_img = Image.open(f).convert("RGB")
+                tensor = pil_image_to_tensor(pil_img)
+                page_data = [{
+                    "input_id": f"{f.name}",
+                    "image_path": str(f),
+                    "page_number": None,
+                    "tensor": tensor,
+                    "device": None,  # Will be assigned by loader
+                }]
+                yield (f, page_data)
+            except Exception as e:
+                console.print(f"[red]Error loading image {f}: {e}[/red]")
+        else:
+            console.print(f"[yellow]Skipping unsupported file: {f}[/yellow]")
+
+
 def load_and_prepare_bitmaps(input_dir: Path, dpi: float = 150, devices: list = None, timings=None) -> List[Dict[str, Any]]:
     """
     Loads all PDF pages and image files as tensors in memory, returning a unified list of dict objects.
@@ -316,41 +361,17 @@ def load_and_prepare_bitmaps(input_dir: Path, dpi: float = 150, devices: list = 
     if devices is None:
         devices = ['cuda:0' if torch.cuda.is_available() else "cpu"]
 
-    files = [Path(f) for f in input_dir.iterdir() if f.is_file()]
     page_entries = []
+    page_counter = 0
 
-    for f in files:
-        mime, _ = mimetypes.guess_type(str(f))
-        ext = f.suffix.lower()
-        if mime == "application/pdf" or ext == ".pdf":
-            # PDF: load all pages as tensors with device list for load balancing
-            for page_info in iter_pdf_page_tensors(str(f), dpi=dpi, device=devices):
-                page_entries.append({
-                    "input_id": f"{f.name}__page_{page_info.page_number}",
-                    "pdf_path": str(f),
-                    "page_number": page_info.page_number,
-                    "tensor": page_info.tensor.detach().clone().float(),  # shape [3,H,W]
-                    "device": page_info.device,  # Track which device this tensor is on
-                })
-        elif ext in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
-            # Image file: load and convert to tensor, cycle through devices
-            try:
-                pil_img = Image.open(f).convert("RGB")
-                tensor = pil_image_to_tensor(pil_img)
-                # Distribute images across devices using round-robin
-                target_device = devices[len(page_entries) % len(devices)]
-                tensor = tensor.to(target_device)
-                page_entries.append({
-                    "input_id": f"{f.name}",
-                    "image_path": str(f),
-                    "page_number": None,
-                    "tensor": tensor,
-                    "device": torch.device(target_device),
-                })
-            except Exception as e:
-                console.print(f"[red]Error loading image {f}: {e}[/red]")
-        else:
-            console.print(f"[yellow]Skipping unsupported file: {f}[/yellow]")
+    for file_path, pages in iter_documents_and_pages(input_dir, dpi=dpi):
+        for page in pages:
+            # Distribute across devices using round-robin
+            target_device = devices[page_counter % len(devices)]
+            page["tensor"] = page["tensor"].to(target_device)
+            page["device"] = torch.device(target_device)
+            page_entries.append(page)
+            page_counter += 1
 
     if timings is not None:
         timings["io_load"] = time.perf_counter() - t0
@@ -408,6 +429,219 @@ def print_timing_breakdown(timings, total_wall):
     pps = total_pages / total_wall if total_wall > 0 else 0
     console.print(f"[bold green]Overall throughput: {pps:.2f} pages/sec ({total_pages} pages, {total_wall:.2f}s wall)[/bold green]")
 
+def document_loader_thread(
+    input_dir: Path,
+    dpi: float,
+    device_list: List[str],
+    document_queues: Dict[str, queue.Queue],
+    pages_per_gpu: int,
+    stop_event: threading.Event,
+    stats: Dict[str, Any],
+    page_semaphores: Dict[str, threading.Semaphore],
+):
+    """
+    Thread that loads documents and distributes them to device queues.
+    Uses semaphores to maintain pages_per_gpu page limit per GPU.
+    """
+    console.print(f"[cyan]Starting document loader thread (max {pages_per_gpu} pages/GPU)...[/cyan]")
+    
+    total_docs_loaded = 0
+    total_pages_loaded = 0
+    doc_counter = 0
+    
+    try:
+        for file_path, pages in iter_documents_and_pages(input_dir, dpi=dpi):
+            if stop_event.is_set():
+                break
+            
+            # Assign to device in round-robin fashion
+            target_device = device_list[doc_counter % len(device_list)]
+            doc_counter += 1
+            
+            num_pages = len(pages)
+            
+            # Acquire semaphore slots for this many pages (blocks if not enough space)
+            # Acquire one at a time to avoid deadlock
+            for _ in range(num_pages):
+                page_semaphores[target_device].acquire()
+            
+            # Move pages to target device
+            for page in pages:
+                page["tensor"] = page["tensor"].to(target_device)
+                page["device"] = torch.device(target_device)
+            
+            # Put document (all its pages) into the device's queue
+            document_queues[target_device].put((file_path, pages, num_pages))
+            total_docs_loaded += 1
+            total_pages_loaded += num_pages
+            
+            if total_docs_loaded % 10 == 0:
+                console.print(f"[cyan]Loader: {total_docs_loaded} documents ({total_pages_loaded} pages) loaded[/cyan]")
+        
+        # Signal completion by putting None sentinel to all queues
+        for device in device_list:
+            document_queues[device].put(None)
+        
+        console.print(f"[green]Document loader completed: {total_docs_loaded} documents ({total_pages_loaded} pages)[/green]")
+        stats["total_docs_loaded"] = total_docs_loaded
+        stats["total_pages_loaded"] = total_pages_loaded
+        
+    except Exception as e:
+        console.print(f"[red]Error in document loader: {e}[/red]")
+        import traceback
+        traceback.print_exc()
+        stop_event.set()
+
+
+def gpu_process_batches_streaming(
+    document_queue: queue.Queue,
+    page_elements_model,
+    table_structure_model,
+    graphic_element_model,
+    ocr_model,
+    device,
+    timings,
+    results_list,
+    batch_size,
+    thread_id=0,
+    graphic_elements_batch_size=32,
+    table_structure_batch_size=32,
+    stop_event=None,
+    pages_counter=None,
+    counter_lock=None,
+    start_time=None,
+    page_semaphore=None,
+):
+    """
+    Process documents from a queue in a streaming fashion.
+    Pulls documents from queue, batches pages, and processes them.
+    Releases semaphore slots as pages are processed.
+    """
+    # Set the CUDA device for this thread
+    torch.cuda.set_device(device)
+    
+    local_results = []
+    batch_idx = 0
+    total_pages = 0
+    
+    # Track start time for wall clock
+    if start_time is None:
+        start_time = time.perf_counter()
+    
+    # Accumulate pages into batches
+    current_batch = []
+    
+    while True:
+        if stop_event and stop_event.is_set():
+            break
+        
+        try:
+            # Get document from queue (non-blocking with timeout)
+            item = document_queue.get(timeout=1.0)
+            
+            if item is None:  # Sentinel value indicating no more documents
+                # Process any remaining pages in current batch
+                if current_batch:
+                    batch_start = time.perf_counter()
+                    batch_results = process_batch_bitmaps(
+                        batch=current_batch,
+                        page_elements_model=page_elements_model,
+                        table_structure_model=table_structure_model,
+                        graphic_element_model=graphic_element_model,
+                        ocr_model=ocr_model,
+                        device=device,
+                        timings=timings,
+                        graphic_elements_batch_size=graphic_elements_batch_size,
+                        table_structure_batch_size=table_structure_batch_size,
+                    )
+                    batch_end = time.perf_counter()
+                    batch_pps = len(current_batch) / (batch_end - batch_start) if (batch_end - batch_start) > 0 else 0
+                    local_results.extend(batch_results)
+                    num_processed = len(current_batch)
+                    total_pages += num_processed
+                    
+                    # Release semaphore slots for processed pages
+                    if page_semaphore is not None:
+                        for _ in range(num_processed):
+                            page_semaphore.release()
+                    
+                    # Update global counter
+                    wall_elapsed = batch_end - start_time
+                    if pages_counter is not None and counter_lock is not None:
+                        with counter_lock:
+                            pages_counter['value'] += num_processed
+                            running_total = pages_counter['value']
+                        console.print(f"[Thread {thread_id}] Final batch ({num_processed} pages) in {batch_end-batch_start:.2f}s [{batch_pps:.2f} pages/sec] | Total: {running_total} pages | Wall: {wall_elapsed:.1f}s")
+                    else:
+                        console.print(f"[Thread {thread_id}] Final batch ({num_processed} pages) in {batch_end-batch_start:.2f}s [{batch_pps:.2f} pages/sec] | Wall: {wall_elapsed:.1f}s")
+                break
+            
+            file_path, pages, num_pages = item
+            
+            # Add pages to current batch
+            for page in pages:
+                current_batch.append(page)
+                
+                # When batch is full, process it
+                if len(current_batch) >= batch_size:
+                    batch_start = time.perf_counter()
+                    batch_results = process_batch_bitmaps(
+                        batch=current_batch,
+                        page_elements_model=page_elements_model,
+                        table_structure_model=table_structure_model,
+                        graphic_element_model=graphic_element_model,
+                        ocr_model=ocr_model,
+                        device=device,
+                        timings=timings,
+                        graphic_elements_batch_size=graphic_elements_batch_size,
+                        table_structure_batch_size=table_structure_batch_size,
+                    )
+                    batch_end = time.perf_counter()
+                    batch_pps = len(current_batch) / (batch_end - batch_start) if (batch_end - batch_start) > 0 else 0
+                    batch_idx += 1
+                    local_results.extend(batch_results)
+                    num_processed = len(current_batch)
+                    total_pages += num_processed
+                    
+                    # Release semaphore slots for processed pages
+                    if page_semaphore is not None:
+                        for _ in range(num_processed):
+                            page_semaphore.release()
+                    
+                    # Update global counter
+                    wall_elapsed = batch_end - start_time
+                    if pages_counter is not None and counter_lock is not None:
+                        with counter_lock:
+                            pages_counter['value'] += num_processed
+                            running_total = pages_counter['value']
+                        console.print(f"[Thread {thread_id}] Batch {batch_idx} ({num_processed} pages) in {batch_end-batch_start:.2f}s [{batch_pps:.2f} pages/sec] | Total: {running_total} pages | Wall: {wall_elapsed:.1f}s")
+                    else:
+                        console.print(f"[Thread {thread_id}] Batch {batch_idx} ({num_processed} pages) in {batch_end-batch_start:.2f}s [{batch_pps:.2f} pages/sec] | Wall: {wall_elapsed:.1f}s")
+                    
+                    current_batch = []
+                    
+                    # Clear cache after each batch
+                    if device.startswith("cuda"):
+                        torch.cuda.empty_cache()
+            
+            # Mark task as done
+            document_queue.task_done()
+            
+        except queue.Empty:
+            # Timeout occurred, check if we should continue
+            continue
+        except Exception as e:
+            console.print(f"[red]Error in GPU processing thread {thread_id}: {e}[/red]")
+            import traceback
+            traceback.print_exc()
+            if stop_event:
+                stop_event.set()
+            break
+    
+    results_list.extend(local_results)
+    console.print(f"[green]Thread {thread_id} completed: {total_pages} pages processed[/green]")
+
+
 def gpu_process_batches(
     batches: List[List[Dict[str, Any]]],
     page_elements_model,
@@ -454,8 +688,31 @@ def run(
     devices: Optional[str] = typer.Option(None, help="Comma-separated list of devices (e.g., 'cuda:0,cuda:1'). If not specified, auto-detects available GPUs."),
     graphic_elements_batch_size: int = typer.Option(32, help="Batch size for graphic elements model processing."),
     table_structure_batch_size: int = typer.Option(32, help="Batch size for table structure model processing."),
+    pages_per_gpu: int = typer.Option(1000, help="Maximum number of pages to keep in memory per GPU (streaming mode)."),
+    streaming: bool = typer.Option(True, help="Use streaming mode to avoid OOM on large datasets."),
+    log_dir: Optional[Path] = typer.Option(None, help="Directory to save log file. If not specified, logs to current directory."),
 ):
     import time
+    
+    # Setup log file
+    if log_dir:
+        log_dir = Path(log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        log_dir = Path(".")
+    
+    log_file = log_dir / get_log_filename()
+    
+    # Start recording console output - create new console with recording
+    from rich.console import Console as RichConsole
+    recording_console = RichConsole(record=True)
+    
+    # Use the recording console for output
+    global console
+    original_console = console
+    console = recording_console
+    
+    console.print(f"[bold cyan]Logging to: {log_file}[/bold cyan]")
 
     # Parse devices parameter or auto-detect
     if devices:
@@ -472,6 +729,7 @@ def run(
             device_list = ["cpu"]
     
     console.print(f"[bold cyan]Using devices: {device_list}[/bold cyan]")
+    console.print(f"[bold cyan]Mode: {'Streaming' if streaming else 'Load All'} ({pages_per_gpu if streaming else 'all'} pages/GPU)[/bold cyan]")
 
     # Load models for each device
     models_per_device = []
@@ -528,52 +786,57 @@ def run(
 
     t_all_start = time.perf_counter()
 
-    # --- ALL INPUT BITMAPS IN MEMORY (distributed across devices) ---
-    t_io_start = time.perf_counter()
-    all_bitmaps = load_and_prepare_bitmaps(input_dir, dpi=dpi, devices=device_list, timings=timings_per_device[0])
-    t_io_end = time.perf_counter()
-    timings_per_device[0]["io_load"] = t_io_end - t_io_start
-    total_pages = len(all_bitmaps)
-    console.print(f"[bold cyan]Found {total_pages} total pages/images for processing.[/bold cyan]")
-
     # Progress warmup
     for i in range(3, 0, -1):
         console.print(f"[bold yellow]{i}[/bold yellow]", end='\r')
         time.sleep(1)
     console.print("[bold green]Go![/bold green]")
 
-    # --- SPLIT BATCHES ACROSS ALL DEVICES ---
-    # Group bitmaps by their assigned device
-    bitmaps_by_device = {device: [] for device in device_list}
-    for bitmap in all_bitmaps:
-        bitmap_device = str(bitmap.get("device", device_list[0]))
-        # Normalize device string
-        for dev in device_list:
-            if bitmap_device == dev or bitmap_device == str(torch.device(dev)):
-                bitmaps_by_device[dev].append(bitmap)
-                break
-
-    # Create batches for each device
-    batches_per_device = []
-    for device in device_list:
-        device_bitmaps = bitmaps_by_device[device]
-        device_batches = [device_bitmaps[i:i+batch_size] for i in range(0, len(device_bitmaps), batch_size)]
-        batches_per_device.append(device_batches)
-        console.print(f"[cyan]Device {device}: {len(device_bitmaps)} pages in {len(device_batches)} batches[/cyan]")
-
     results_per_device = [[] for _ in device_list]
-
     t_pipeline_start = time.perf_counter()
-    threads = []
 
-    # Create a thread for each device
-    for idx, (device, models, batches) in enumerate(zip(device_list, models_per_device, batches_per_device)):
-        if len(batches) > 0:  # Only create thread if there are batches to process
-            print(f"Models: {models}, device: {device}, batches: {len(batches)}")
+    if streaming:
+        # --- STREAMING MODE: Load documents on-demand ---
+        console.print(f"[bold cyan]Starting streaming pipeline (max {pages_per_gpu * len(device_list)} pages in memory)[/bold cyan]")
+        
+        # Create unbounded queues and semaphores for each device
+        document_queues = {device: queue.Queue() for device in device_list}
+        page_semaphores = {device: threading.Semaphore(pages_per_gpu) for device in device_list}
+        
+        # Shared state
+        stop_event = threading.Event()
+        loader_stats = {}
+        pages_counter = {'value': 0}  # Shared counter for pages processed
+        counter_lock = threading.Lock()
+        
+        # Track loading and processing start time
+        t_load_start = time.perf_counter()
+        t_process_start = time.perf_counter()
+        
+        # Start document loader thread
+        loader_thread = threading.Thread(
+            target=document_loader_thread,
+            args=(
+                input_dir,
+                dpi,
+                device_list,
+                document_queues,
+                pages_per_gpu,
+                stop_event,
+                loader_stats,
+                page_semaphores,
+            ),
+            daemon=True,
+        )
+        loader_thread.start()
+        
+        # Start processing threads for each device
+        threads = []
+        for idx, (device, models) in enumerate(zip(device_list, models_per_device)):
             th = threading.Thread(
-                target=gpu_process_batches,
+                target=gpu_process_batches_streaming,
                 args=(
-                    batches,
+                    document_queues[device],
                     models["page_elements"],
                     models["table_structure"],
                     models["graphic_elements"],
@@ -581,19 +844,95 @@ def run(
                     device,
                     timings_per_device[idx],
                     results_per_device[idx],
+                    batch_size,
                     idx,
                     graphic_elements_batch_size,
                     table_structure_batch_size,
-                ))
+                    stop_event,
+                    pages_counter,
+                    counter_lock,
+                    t_process_start,
+                    page_semaphores[device],
+                ),
+            )
             threads.append(th)
+        
+        # Start all processing threads
+        for th in threads:
+            th.start()
+        
+        # Wait for loader to finish
+        loader_thread.join()
+        t_load_end = time.perf_counter()
+        
+        # Wait for all processing threads to complete
+        for th in threads:
+            th.join()
+        
+        # Record loading time (distributed across devices)
+        load_time = t_load_end - t_load_start
+        timings_per_device[0]["io_load"] = load_time
+        
+        console.print(f"[green]Loader stats: {loader_stats}[/green]")
+        
+    else:
+        # --- LOAD ALL MODE: Original behavior ---
+        t_io_start = time.perf_counter()
+        all_bitmaps = load_and_prepare_bitmaps(input_dir, dpi=dpi, devices=device_list, timings=timings_per_device[0])
+        t_io_end = time.perf_counter()
+        timings_per_device[0]["io_load"] = t_io_end - t_io_start
+        total_pages = len(all_bitmaps)
+        console.print(f"[bold cyan]Found {total_pages} total pages/images for processing.[/bold cyan]")
 
-    # Start all threads
-    for th in threads:
-        th.start()
+        # --- SPLIT BATCHES ACROSS ALL DEVICES ---
+        # Group bitmaps by their assigned device
+        bitmaps_by_device = {device: [] for device in device_list}
+        for bitmap in all_bitmaps:
+            bitmap_device = str(bitmap.get("device", device_list[0]))
+            # Normalize device string
+            for dev in device_list:
+                if bitmap_device == dev or bitmap_device == str(torch.device(dev)):
+                    bitmaps_by_device[dev].append(bitmap)
+                    break
 
-    # Wait for all threads to complete
-    for th in threads:
-        th.join()
+        # Create batches for each device
+        batches_per_device = []
+        for device in device_list:
+            device_bitmaps = bitmaps_by_device[device]
+            device_batches = [device_bitmaps[i:i+batch_size] for i in range(0, len(device_bitmaps), batch_size)]
+            batches_per_device.append(device_batches)
+            console.print(f"[cyan]Device {device}: {len(device_bitmaps)} pages in {len(device_batches)} batches[/cyan]")
+
+        threads = []
+
+        # Create a thread for each device
+        for idx, (device, models, batches) in enumerate(zip(device_list, models_per_device, batches_per_device)):
+            if len(batches) > 0:  # Only create thread if there are batches to process
+                print(f"Models: {models}, device: {device}, batches: {len(batches)}")
+                th = threading.Thread(
+                    target=gpu_process_batches,
+                    args=(
+                        batches,
+                        models["page_elements"],
+                        models["table_structure"],
+                        models["graphic_elements"],
+                        models["ocr"],
+                        device,
+                        timings_per_device[idx],
+                        results_per_device[idx],
+                        idx,
+                        graphic_elements_batch_size,
+                        table_structure_batch_size,
+                    ))
+                threads.append(th)
+
+        # Start all threads
+        for th in threads:
+            th.start()
+
+        # Wait for all threads to complete
+        for th in threads:
+            th.join()
 
     t_pipeline_end = time.perf_counter()
     pipeline_wall_time = t_pipeline_end - t_pipeline_start
@@ -643,3 +982,18 @@ def run(
     print_timing_breakdown(total_timings, total_wall)
 
     console.print("[bold green]Done![/bold green]")
+    
+    # Save console output to log file
+    try:
+        console_text = console.export_text()
+        with open(log_file, 'w', encoding='utf-8') as f:
+            f.write(console_text)
+        console.print(f"[bold cyan]Log saved to: {log_file}[/bold cyan]")
+        # Re-export to include the last message
+        with open(log_file, 'w', encoding='utf-8') as f:
+            f.write(console.export_text())
+    except Exception as e:
+        console.print(f"[yellow]Warning: Could not save log file: {e}[/yellow]")
+    finally:
+        # Restore original console
+        console = original_console
