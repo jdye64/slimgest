@@ -105,7 +105,7 @@ def iter_pdf_page_bitmaps(
 def iter_pdf_page_tensors(
     pdf_path: Union[str, Path],
     dpi: float = 150.0,
-    device: Union[str, torch.device] = "cpu",
+    device: Union[str, torch.device, list] = "cpu",
     dtype: torch.dtype = torch.uint8,
     rotation: int = 0,
     grayscale: bool = False,
@@ -120,7 +120,9 @@ def iter_pdf_page_tensors(
     Args:
         pdf_path: Path to the PDF file.
         dpi: DPI for rendering (default 150).
-        device: Target device for tensors ("cpu", "cuda", or torch.device object).
+        device: Target device(s) for tensors. Can be:
+            - Single device: "cpu", "cuda", or torch.device object
+            - List of devices: ["cuda:0", "cuda:1"] for load balancing across multiple GPUs
         dtype: Data type for tensors (default torch.uint8).
         rotation: Rotation angle in degrees (0, 90, 180, 270).
         grayscale: If True, render in grayscale (1 channel) instead of RGB (3 channels).
@@ -130,13 +132,25 @@ def iter_pdf_page_tensors(
         PageTensor objects containing the tensor and metadata.
     
     Example:
+        >>> # Single device
         >>> for page_tensor in iter_pdf_page_tensors("document.pdf", device="cuda"):
         ...     tensor = page_tensor.tensor  # Shape: [3, H, W]
         ...     print(f"Page {page_tensor.page_number}: {tensor.shape}, device={tensor.device}")
+        
+        >>> # Multiple devices (round-robin load balancing)
+        >>> for page_tensor in iter_pdf_page_tensors("document.pdf", device=["cuda:0", "cuda:1"]):
+        ...     tensor = page_tensor.tensor  # Shape: [3, H, W]
+        ...     print(f"Page {page_tensor.page_number}: device={tensor.device}")
     """
-    if isinstance(device, str):
-        device = torch.device(device)
+    # Handle device parameter - convert to list of devices
+    if isinstance(device, list):
+        devices = [torch.device(d) if isinstance(d, str) else d for d in device]
+    elif isinstance(device, str):
+        devices = [torch.device(device)]
+    else:
+        devices = [device]
     
+    device_idx = 0
     for page_bitmap in iter_pdf_page_bitmaps(pdf_path, dpi, rotation, grayscale):
         # Convert bitmap to numpy array (RGB only)
         arr = page_bitmap.to_numpy(rgb_only=True)
@@ -144,22 +158,26 @@ def iter_pdf_page_tensors(
         # Convert to tensor: [H, W, C] -> [C, H, W]
         tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
         
+        # Round-robin device selection if multiple devices
+        target_device = devices[device_idx % len(devices)]
+        device_idx += 1
+        
         # Move to target device
-        tensor = tensor.to(device=device, dtype=dtype, non_blocking=non_blocking)
+        tensor = tensor.to(device=target_device, dtype=dtype, non_blocking=non_blocking)
         
         yield PageTensor(
             page_number=page_bitmap.page_number,
             tensor=tensor,
             original_width=page_bitmap.width,
             original_height=page_bitmap.height,
-            device=device,
+            device=target_device,
         )
 
 
 def load_pdf_page_tensors(
     pdf_path: Union[str, Path],
     dpi: float = 150.0,
-    device: Union[str, torch.device] = "cpu",
+    device: Union[str, torch.device, list] = "cpu",
     dtype: torch.dtype = torch.uint8,
     rotation: int = 0,
     grayscale: bool = False,
@@ -174,7 +192,9 @@ def load_pdf_page_tensors(
     Args:
         pdf_path: Path to the PDF file.
         dpi: DPI for rendering (default 150).
-        device: Target device for tensors.
+        device: Target device(s) for tensors. Can be:
+            - Single device: "cpu", "cuda", or torch.device object
+            - List of devices: ["cuda:0", "cuda:1"] for load balancing across multiple GPUs
         dtype: Data type for tensors (default torch.uint8).
         rotation: Rotation angle in degrees.
         grayscale: If True, render in grayscale.
@@ -184,6 +204,11 @@ def load_pdf_page_tensors(
         Tuple of (tensors, shapes) where:
             - tensors: List of tensors, each of shape [C, H, W]
             - shapes: List of (height, width) tuples for original dimensions
+            
+    Example:
+        >>> # Load with multiple GPUs (round-robin distribution)
+        >>> tensors, shapes = load_pdf_page_tensors("doc.pdf", device=["cuda:0", "cuda:1"])
+        >>> # tensors[0] on cuda:0, tensors[1] on cuda:1, tensors[2] on cuda:0, etc.
     """
     tensors = []
     shapes = []

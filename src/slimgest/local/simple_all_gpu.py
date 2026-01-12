@@ -230,12 +230,13 @@ def run_pipeline(
 def run(
     input_dir: Path = typer.Argument(..., exists=True, file_okay=True),
     raw_output_dir: Optional[Path] = typer.Option(None, help="Directory to save raw OCR results (optional)."),
+    device: str = typer.Option("cuda", help="Device to use (e.g., 'cuda', 'cuda:0', 'cpu')."),
 ):
     # Load Page Elements model
-    page_elements_model = define_model_page_elements("page_element_v3")
-    table_structure_model = define_model_table_structure("table_structure_v1")
-    graphic_elements_model = define_model_graphic_elements("graphic_elements_v1")
-    ocr_model = NemotronOCR(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints")
+    page_elements_model = define_model_page_elements("page_element_v3").to(device)
+    table_structure_model = define_model_table_structure("table_structure_v1").to(device)
+    graphic_elements_model = define_model_graphic_elements("graphic_elements_v1").to(device)
+    ocr_model = NemotronOCR(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints", device=device)
 
     
     if input_dir.is_file():
@@ -247,9 +248,11 @@ def run(
         ]
 
     console.print(f"Processing {len(pdf_files)} PDFs")
-    console.print(f"Using page_elements_model device: {page_elements_model.device}")
-    console.print(f"Using table_structure_model device: {table_structure_model.device}")
-    console.print(f"Using graphic_elements_model device: {graphic_elements_model.device}")
+    console.print(f"Using device: {device}")
+    console.print(f"  - page_elements_model: {page_elements_model.device}")
+    console.print(f"  - table_structure_model: {table_structure_model.device}")
+    console.print(f"  - graphic_elements_model: {graphic_elements_model.device}")
+    console.print(f"  - ocr_model: {device}")
     
     import time
 

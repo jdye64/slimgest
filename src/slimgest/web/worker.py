@@ -20,7 +20,7 @@ from slimgest.local.simple_all_gpu import run_pipeline, process_pdf_pages
 class PDFWorker:
     """Worker process that handles PDF processing tasks."""
     
-    def __init__(self, worker_id: int, request_queue: Queue, result_queue: Queue, ocr_model_dir: str):
+    def __init__(self, worker_id: int, request_queue: Queue, result_queue: Queue, ocr_model_dir: str, device: str = "cuda"):
         """
         Initialize the PDF worker.
         
@@ -29,28 +29,30 @@ class PDFWorker:
             request_queue: Queue to receive processing requests
             result_queue: Queue to send results back
             ocr_model_dir: Directory containing the OCR model
+            device: Device to use for models (e.g., 'cuda', 'cuda:0', 'cpu')
         """
         self.worker_id = worker_id
         self.request_queue = request_queue
         self.result_queue = result_queue
         self.ocr_model_dir = ocr_model_dir
+        self.device = device
         self.models = {}
         
     def load_models(self):
         """Load all models in the worker process."""
-        print(f"[WORKER-{self.worker_id}] Loading models...")
+        print(f"[WORKER-{self.worker_id}] Loading models on device: {self.device}...")
         
         # Load models
-        self.models["page_elements"] = define_model_page_elements("page_element_v3")
-        self.models["table_structure"] = define_model_table_structure("table_structure_v1")
-        self.models["graphic_elements"] = define_model_graphic_elements("graphic_elements_v1")
-        self.models["ocr"] = NemotronOCR(model_dir=self.ocr_model_dir)
+        self.models["page_elements"] = define_model_page_elements("page_element_v3").to(self.device)
+        self.models["table_structure"] = define_model_table_structure("table_structure_v1").to(self.device)
+        self.models["graphic_elements"] = define_model_graphic_elements("graphic_elements_v1").to(self.device)
+        self.models["ocr"] = NemotronOCR(model_dir=self.ocr_model_dir, device=self.device)
         
         print(f"[WORKER-{self.worker_id}] Models loaded")
         print(f"[WORKER-{self.worker_id}]   - Page Elements (device: {self.models['page_elements'].device})")
         print(f"[WORKER-{self.worker_id}]   - Table Structure (device: {self.models['table_structure'].device})")
         print(f"[WORKER-{self.worker_id}]   - Graphic Elements (device: {self.models['graphic_elements'].device})")
-        print(f"[WORKER-{self.worker_id}]   - OCR Model")
+        print(f"[WORKER-{self.worker_id}]   - OCR Model (device: {self.device})")
         
     def process_batch_request(self, job_id: str, pdf_paths: list, dpi: float) -> Dict[str, Any]:
         """
@@ -165,7 +167,7 @@ class PDFWorker:
                 self.models["table_structure"],
                 self.models["graphic_elements"],
                 self.models["ocr"],
-                device="cuda",
+                device=self.device,
                 dpi=dpi,
             ):
                 page_count += 1
@@ -272,7 +274,7 @@ class PDFWorker:
         print(f"[WORKER-{self.worker_id}] Shutting down")
 
 
-def start_worker(worker_id: int, request_queue: Queue, result_queue: Queue, ocr_model_dir: str):
+def start_worker(worker_id: int, request_queue: Queue, result_queue: Queue, ocr_model_dir: str, device: str = "cuda"):
     """
     Start a worker process.
     
@@ -281,6 +283,7 @@ def start_worker(worker_id: int, request_queue: Queue, result_queue: Queue, ocr_
         request_queue: Queue to receive processing requests
         result_queue: Queue to send results back
         ocr_model_dir: Directory containing the OCR model
+        device: Device to use for models (e.g., 'cuda', 'cuda:0', 'cpu')
     """
-    worker = PDFWorker(worker_id, request_queue, result_queue, ocr_model_dir)
+    worker = PDFWorker(worker_id, request_queue, result_queue, ocr_model_dir, device)
     worker.run()

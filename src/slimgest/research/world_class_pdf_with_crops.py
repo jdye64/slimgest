@@ -36,10 +36,10 @@ class DocumentEngine:
             self._load_models()
 
     def _load_models(self):
-        self.page_elements_model = define_model("page_element_v3")
-        self.table_structure_model = define_model_table_structure("table_structure_v1")
-        self.graphic_elements_model = define_model_graphic_elements("graphic_elements_v1")
-        self.ocr_model = NemotronOCR(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints")
+        self.page_elements_model = define_model("page_element_v3").to(self.device)
+        self.table_structure_model = define_model_table_structure("table_structure_v1").to(self.device)
+        self.graphic_elements_model = define_model_graphic_elements("graphic_elements_v1").to(self.device)
+        self.ocr_model = NemotronOCR(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints", device=self.device)
 
     def _device_resize_pad_image(self, img: torch.Tensor, size: tuple) -> torch.Tensor:
         """
@@ -232,8 +232,9 @@ app = typer.Typer(help="Process PDFs locally using shared pipeline")
 @app.command()
 def run(
     input_dir: Path = typer.Argument(..., exists=True, file_okay=False),
+    device: str = typer.Option("cuda", help="Device to use (e.g., 'cuda', 'cuda:0', 'cpu')."),
 ):
-    engine = DocumentEngine(device="cuda:0", pdf_render_dpi=300, preload_models=True)
+    engine = DocumentEngine(device=device, pdf_render_dpi=300, preload_models=True)
 
 
     # TODO: Refactor page_elements_model.labels to be a class variable and expose this so as no need to redeclare this list here.
