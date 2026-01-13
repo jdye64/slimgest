@@ -17,6 +17,7 @@ import queue
 import sys
 import subprocess
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 from nemotron_page_elements_v3.model import define_model as define_model_page_elements
 from nemotron_page_elements_v3.model import resize_pad as resize_pad_page_elements
@@ -70,6 +71,118 @@ def pil_image_to_tensor(img: Image.Image) -> torch.Tensor:
     arr = arr.transpose(2, 0, 1)
     return torch.from_numpy(arr) / 255.0  # Normalize to [0,1]
 
+
+class PageCache:
+    """
+    Thread-safe cache for pre-loading pages in CPU memory with pinned memory support.
+    Maintains separate queues per device to ensure pages reach the correct GPU.
+    """
+    def __init__(self, max_size: int = 20000, initial_fill_percent: float = 0.5, devices: List[str] = None):
+        self.max_size = max_size
+        self.initial_fill_size = int(max_size * initial_fill_percent)
+        self.devices = devices or ["cuda:0"]
+        
+        # Separate queue per device
+        self.device_pages = {device: [] for device in self.devices}
+        
+        self.lock = threading.Lock()
+        self.not_empty = threading.Condition(self.lock)
+        self.not_full = threading.Condition(self.lock)
+        self.cache_ready = threading.Event()  # Signals when initial fill is complete
+        self.loading_complete = False
+        self.total_loaded = 0
+        self.total_consumed = 0
+        
+    def add_pages(self, pages: List[Dict[str, Any]]) -> bool:
+        """
+        Add pages to cache. Routes to device-specific queues. Blocks if cache is full.
+        Returns False if loading should stop.
+        Note: Pins memory here as pinned tensors can't be pickled across processes.
+        """
+        with self.not_full:
+            # Check total size across all devices
+            total_size = sum(len(queue) for queue in self.device_pages.values())
+            while total_size + len(pages) > self.max_size:
+                if self.loading_complete:
+                    return False
+                self.not_full.wait(timeout=1.0)
+                total_size = sum(len(queue) for queue in self.device_pages.values())
+            
+            # Pin memory and route to device-specific queues
+            for page in pages:
+                if not page["tensor"].is_pinned():
+                    page["tensor"] = page["tensor"].pin_memory()
+                
+                target_device = page.get("target_device", self.devices[0])
+                if target_device in self.device_pages:
+                    self.device_pages[target_device].append(page)
+                else:
+                    # Fallback to first device if target not found
+                    self.device_pages[self.devices[0]].append(page)
+            
+            self.total_loaded += len(pages)
+            
+            # Signal cache ready once initial fill is complete
+            total_size = sum(len(queue) for queue in self.device_pages.values())
+            if not self.cache_ready.is_set() and total_size >= self.initial_fill_size:
+                self.cache_ready.set()
+            
+            self.not_empty.notify_all()
+            return True
+    
+    def get_pages(self, max_count: int, device: str) -> List[Dict[str, Any]]:
+        """
+        Get up to max_count pages from cache for a specific device.
+        Blocks if cache is empty. Returns empty list if loading is complete and cache is empty.
+        """
+        with self.not_empty:
+            device_queue = self.device_pages.get(device, [])
+            
+            while len(device_queue) == 0:
+                if self.loading_complete:
+                    return []
+                self.not_empty.wait(timeout=1.0)
+                device_queue = self.device_pages.get(device, [])
+            
+            # Get up to max_count pages from this device's queue
+            count = min(max_count, len(device_queue))
+            result = device_queue[:count]
+            self.device_pages[device] = device_queue[count:]
+            self.total_consumed += count
+            
+            self.not_full.notify_all()
+            return result
+    
+    def mark_loading_complete(self):
+        """Signal that no more pages will be loaded."""
+        with self.lock:
+            self.loading_complete = True
+            # Set cache ready even if we didn't reach initial fill (small dataset)
+            if not self.cache_ready.is_set():
+                self.cache_ready.set()
+            self.not_empty.notify_all()
+            self.not_full.notify_all()
+    
+    def wait_until_ready(self, timeout: Optional[float] = None) -> bool:
+        """
+        Wait until cache has reached initial fill size.
+        Returns True if ready, False if timeout occurred.
+        """
+        return self.cache_ready.wait(timeout=timeout)
+    
+    def get_stats(self) -> Dict[str, int]:
+        """Get cache statistics."""
+        with self.lock:
+            total_size = sum(len(queue) for queue in self.device_pages.values())
+            per_device = {device: len(queue) for device, queue in self.device_pages.items()}
+            return {
+                "current_size": total_size,
+                "max_size": self.max_size,
+                "total_loaded": self.total_loaded,
+                "total_consumed": self.total_consumed,
+                "per_device": per_device,
+            }
+
 def process_batch_bitmaps(
     batch: List[Dict[str, Any]],
     page_elements_model,
@@ -120,13 +233,14 @@ def process_batch_bitmaps(
     ocr_invocations = 0
 
     # STEP 1: Prepare all tensors and batch them for page elements
+    # Note: Tensors are already on the correct device from gpu_process_batches_streaming
     t_prep = time.perf_counter()
     batch_tensors = []
     batch_shapes = []
     batch_metadata = []
     
     for page in batch:
-        tensor = page["tensor"].to(device, non_blocking=True)
+        tensor = page["tensor"]  # Already on device - no transfer needed
         batch_tensors.append(tensor)
         batch_shapes.append((tensor.shape[1], tensor.shape[2]))
         batch_metadata.append({
@@ -190,9 +304,11 @@ def process_batch_bitmaps(
         
         # Collect crops for batched processing
         for label, box in zip(labels, boxes):
+            # crop_tensor_with_bbox returns a view, clone it to avoid memory issues
+            # But resize operations below create new tensors anyway, so clone is actually needed here
             cropped = crop_tensor_with_bbox(
                 resized_tensor, box, bitmap_shape, page_elements_input_shape
-            ).clone()
+            ).clone()  # Clone needed: resize ops create contiguous tensors
             crop_shape = (cropped.shape[1], cropped.shape[2])
             
             if label == 0:  # Table
@@ -433,54 +549,109 @@ def document_loader_thread(
     input_dir: Path,
     dpi: float,
     device_list: List[str],
-    document_queues: Dict[str, queue.Queue],
-    pages_per_gpu: int,
+    page_cache: PageCache,
     stop_event: threading.Event,
     stats: Dict[str, Any],
-    page_semaphores: Dict[str, threading.Semaphore],
 ):
     """
-    Thread that loads documents and distributes them to device queues.
-    Uses semaphores to maintain pages_per_gpu page limit per GPU.
+    Thread that loads documents sequentially into CPU cache.
     """
-    console.print(f"[cyan]Starting document loader thread (max {pages_per_gpu} pages/GPU)...[/cyan]")
+    console.print(f"[cyan]Starting document loader...[/cyan]")
+    console.print(f"[cyan]Pre-filling cache: target {page_cache.initial_fill_size}/{page_cache.max_size} pages...[/cyan]")
     
     total_docs_loaded = 0
     total_pages_loaded = 0
-    doc_counter = 0
+    cache_ready_announced = False
+    doc_id = 0
+    
+    # Get list of all files to process
+    files = sorted([f for f in input_dir.iterdir() if f.is_file()])
+    
+    # Filter for supported file types
+    supported_files = []
+    for f in files:
+        mime, _ = mimetypes.guess_type(str(f))
+        ext = f.suffix.lower()
+        if mime == "application/pdf" or ext == ".pdf" or ext in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
+            supported_files.append(f)
+    
+    console.print(f"[cyan]Found {len(supported_files)} documents to process[/cyan]")
     
     try:
-        for file_path, pages in iter_documents_and_pages(input_dir, dpi=dpi):
+        for file_path in supported_files:
             if stop_event.is_set():
                 break
             
-            # Assign to device in round-robin fashion
-            target_device = device_list[doc_counter % len(device_list)]
-            doc_counter += 1
+            # Assign target device (round-robin)
+            target_device = device_list[doc_id % len(device_list)]
             
-            num_pages = len(pages)
+            try:
+                pages = []
+                mime, _ = mimetypes.guess_type(str(file_path))
+                ext = file_path.suffix.lower()
+                
+                if mime == "application/pdf" or ext == ".pdf":
+                    # PDF: load all pages directly on CPU (already specified in device parameter)
+                    for page_info in iter_pdf_page_tensors(str(file_path), dpi=dpi, device=['cpu']):
+                        # Tensor is already on CPU from iter_pdf_page_tensors, already float from .float() conversion
+                        # Just ensure it's float32 (will be converted to float by PageCache.add_pages when pinned)
+                        pages.append({
+                            "input_id": f"{file_path.name}__page_{page_info.page_number}",
+                            "pdf_path": str(file_path),
+                            "page_number": page_info.page_number,
+                            "tensor": page_info.tensor.float(),  # Simplified - no unnecessary ops
+                            "device": None,
+                            "target_device": target_device,
+                            "file_path": str(file_path),
+                        })
+                        
+                elif ext in [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]:
+                    # Image file - pil_image_to_tensor returns CPU tensor by default
+                    pil_img = Image.open(file_path).convert("RGB")
+                    tensor = pil_image_to_tensor(pil_img)  # Returns float32 CPU tensor
+                    
+                    pages.append({
+                        "input_id": f"{file_path.name}",
+                        "image_path": str(file_path),
+                        "page_number": None,
+                        "tensor": tensor,
+                        "device": None,
+                        "target_device": target_device,
+                        "file_path": str(file_path),
+                    })
+                
+                if pages:
+                    # Add to cache (blocks if cache is full)
+                    if not page_cache.add_pages(pages):
+                        break
+                    
+                    total_docs_loaded += 1
+                    total_pages_loaded += len(pages)
+                    doc_id += 1
+                    
+                    # Announce when cache is ready for processing
+                    if not cache_ready_announced and page_cache.cache_ready.is_set():
+                        console.print(f"[bold green]✓ Cache ready! ({total_pages_loaded} pages loaded, starting GPU processing...)[/bold green]")
+                        cache_ready_announced = True
+                    
+                    # Report progress
+                    if total_docs_loaded % 10 == 0:
+                        cache_stats = page_cache.get_stats()
+                        status = "pre-filling" if not cache_ready_announced else "loading"
+                        console.print(f"[cyan]Loader ({status}): {total_docs_loaded} docs ({total_pages_loaded} pages) | Cache: {cache_stats['current_size']}/{cache_stats['max_size']} pages[/cyan]")
+                else:
+                    console.print(f"[yellow]Warning: No pages loaded from {file_path}[/yellow]")
             
-            # Acquire semaphore slots for this many pages (blocks if not enough space)
-            # Acquire one at a time to avoid deadlock
-            for _ in range(num_pages):
-                page_semaphores[target_device].acquire()
-            
-            # Move pages to target device
-            for page in pages:
-                page["tensor"] = page["tensor"].to(target_device)
-                page["device"] = torch.device(target_device)
-            
-            # Put document (all its pages) into the device's queue
-            document_queues[target_device].put((file_path, pages, num_pages))
-            total_docs_loaded += 1
-            total_pages_loaded += num_pages
-            
-            if total_docs_loaded % 10 == 0:
-                console.print(f"[cyan]Loader: {total_docs_loaded} documents ({total_pages_loaded} pages) loaded[/cyan]")
+            except Exception as e:
+                console.print(f"[red]Error loading file: {file_path}[/red]")
+                console.print(f"[red]Exception: {type(e).__name__}: {str(e)[:200]}[/red]")
+                import traceback
+                traceback.print_exc()
+                # Continue with next file
+                continue
         
-        # Signal completion by putting None sentinel to all queues
-        for device in device_list:
-            document_queues[device].put(None)
+        # Mark loading as complete
+        page_cache.mark_loading_complete()
         
         console.print(f"[green]Document loader completed: {total_docs_loaded} documents ({total_pages_loaded} pages)[/green]")
         stats["total_docs_loaded"] = total_docs_loaded
@@ -490,11 +661,12 @@ def document_loader_thread(
         console.print(f"[red]Error in document loader: {e}[/red]")
         import traceback
         traceback.print_exc()
+        page_cache.mark_loading_complete()
         stop_event.set()
 
 
 def gpu_process_batches_streaming(
-    document_queue: queue.Queue,
+    page_cache: PageCache,
     page_elements_model,
     table_structure_model,
     graphic_element_model,
@@ -510,12 +682,11 @@ def gpu_process_batches_streaming(
     pages_counter=None,
     counter_lock=None,
     start_time=None,
-    page_semaphore=None,
 ):
     """
-    Process documents from a queue in a streaming fashion.
-    Pulls documents from queue, batches pages, and processes them.
-    Releases semaphore slots as pages are processed.
+    Process pages from cache in a streaming fashion.
+    Pulls pages from cache, filters by device, and processes them.
+    Uses async GPU transfers for optimal performance.
     """
     # Set the CUDA device for this thread
     torch.cuda.set_device(device)
@@ -531,16 +702,22 @@ def gpu_process_batches_streaming(
     # Accumulate pages into batches
     current_batch = []
     
+    # Create CUDA stream for async transfers
+    if device.startswith("cuda"):
+        cuda_stream = torch.cuda.Stream(device=device)
+    else:
+        cuda_stream = None
+    
     while True:
         if stop_event and stop_event.is_set():
             break
         
         try:
-            # Get document from queue (non-blocking with timeout)
-            item = document_queue.get(timeout=1.0)
+            # Get pages from cache for this specific device (no filtering needed)
+            pages = page_cache.get_pages(max_count=batch_size, device=device)
             
-            if item is None:  # Sentinel value indicating no more documents
-                # Process any remaining pages in current batch
+            if not pages:
+                # Cache is empty and loading complete - process remaining batch
                 if current_batch:
                     batch_start = time.perf_counter()
                     batch_results = process_batch_bitmaps(
@@ -560,11 +737,6 @@ def gpu_process_batches_streaming(
                     num_processed = len(current_batch)
                     total_pages += num_processed
                     
-                    # Release semaphore slots for processed pages
-                    if page_semaphore is not None:
-                        for _ in range(num_processed):
-                            page_semaphore.release()
-                    
                     # Update global counter
                     wall_elapsed = batch_end - start_time
                     if pages_counter is not None and counter_lock is not None:
@@ -576,14 +748,25 @@ def gpu_process_batches_streaming(
                         console.print(f"[Thread {thread_id}] Final batch ({num_processed} pages) in {batch_end-batch_start:.2f}s [{batch_pps:.2f} pages/sec] | Wall: {wall_elapsed:.1f}s")
                 break
             
-            file_path, pages, num_pages = item
-            
+            # All pages are already for this device - no filtering needed
             # Add pages to current batch
             for page in pages:
+                # Async transfer to GPU using non_blocking
+                if cuda_stream is not None:
+                    with torch.cuda.stream(cuda_stream):
+                        page["tensor"] = page["tensor"].to(device, non_blocking=True)
+                        page["device"] = torch.device(device)
+                else:
+                    page["tensor"] = page["tensor"].to(device)
+                    page["device"] = torch.device(device)
+                
                 current_batch.append(page)
                 
                 # When batch is full, process it
                 if len(current_batch) >= batch_size:
+                    # Synchronize stream before processing
+                    if cuda_stream is not None:
+                        cuda_stream.synchronize()
                     batch_start = time.perf_counter()
                     batch_results = process_batch_bitmaps(
                         batch=current_batch,
@@ -603,11 +786,6 @@ def gpu_process_batches_streaming(
                     num_processed = len(current_batch)
                     total_pages += num_processed
                     
-                    # Release semaphore slots for processed pages
-                    if page_semaphore is not None:
-                        for _ in range(num_processed):
-                            page_semaphore.release()
-                    
                     # Update global counter
                     wall_elapsed = batch_end - start_time
                     if pages_counter is not None and counter_lock is not None:
@@ -623,9 +801,6 @@ def gpu_process_batches_streaming(
                     # Clear cache after each batch
                     if device.startswith("cuda"):
                         torch.cuda.empty_cache()
-            
-            # Mark task as done
-            document_queue.task_done()
             
         except queue.Empty:
             # Timeout occurred, check if we should continue
@@ -688,9 +863,12 @@ def run(
     devices: Optional[str] = typer.Option(None, help="Comma-separated list of devices (e.g., 'cuda:0,cuda:1'). If not specified, auto-detects available GPUs."),
     graphic_elements_batch_size: int = typer.Option(32, help="Batch size for graphic elements model processing."),
     table_structure_batch_size: int = typer.Option(32, help="Batch size for table structure model processing."),
-    pages_per_gpu: int = typer.Option(1000, help="Maximum number of pages to keep in memory per GPU (streaming mode)."),
+    pages_per_gpu: int = typer.Option(1000, help="Maximum number of pages to keep in memory per GPU (streaming mode, deprecated - use cache-size)."),
     streaming: bool = typer.Option(True, help="Use streaming mode to avoid OOM on large datasets."),
     log_dir: Optional[Path] = typer.Option(None, help="Directory to save log file. If not specified, logs to current directory."),
+    ocr_model_dir: Path = typer.Option("models/nemotron-ocr-v1/checkpoints", help="Path to NemotronOCR model directory."),
+    cache_size: int = typer.Option(20000, help="Number of pages to pre-load in CPU memory cache (streaming mode)."),
+    cache_fill_percent: float = typer.Option(0.5, help="Percentage of cache to fill before starting GPU processing (0.0-1.0)."),
 ):
     import time
     
@@ -729,7 +907,10 @@ def run(
             device_list = ["cpu"]
     
     console.print(f"[bold cyan]Using devices: {device_list}[/bold cyan]")
-    console.print(f"[bold cyan]Mode: {'Streaming' if streaming else 'Load All'} ({pages_per_gpu if streaming else 'all'} pages/GPU)[/bold cyan]")
+    if streaming:
+        console.print(f"[bold cyan]Mode: Streaming (CPU cache: {cache_size} pages)[/bold cyan]")
+    else:
+        console.print(f"[bold cyan]Mode: Load All[/bold cyan]")
 
     # Load models for each device
     models_per_device = []
@@ -748,7 +929,7 @@ def run(
         if hasattr(graphic_elements_model, 'device'):
             graphic_elements_model.device = torch.device(device)
             
-        ocr_model = NemotronOCR(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints", device=device)
+        ocr_model = NemotronOCR(model_dir=str(ocr_model_dir), device=device)
         
         models_per_device.append({
             "device": device,
@@ -796,12 +977,11 @@ def run(
     t_pipeline_start = time.perf_counter()
 
     if streaming:
-        # --- STREAMING MODE: Load documents on-demand ---
-        console.print(f"[bold cyan]Starting streaming pipeline (max {pages_per_gpu * len(device_list)} pages in memory)[/bold cyan]")
+        # --- STREAMING MODE: Load documents into CPU cache ---
+        console.print(f"[bold cyan]Starting streaming pipeline with CPU cache ({cache_size} pages)[/bold cyan]")
         
-        # Create unbounded queues and semaphores for each device
-        document_queues = {device: queue.Queue() for device in device_list}
-        page_semaphores = {device: threading.Semaphore(pages_per_gpu) for device in device_list}
+        # Create shared page cache with initial fill percentage and device routing
+        page_cache = PageCache(max_size=cache_size, initial_fill_percent=cache_fill_percent, devices=device_list)
         
         # Shared state
         stop_event = threading.Event()
@@ -820,23 +1000,29 @@ def run(
                 input_dir,
                 dpi,
                 device_list,
-                document_queues,
-                pages_per_gpu,
+                page_cache,
                 stop_event,
                 loader_stats,
-                page_semaphores,
             ),
             daemon=True,
         )
         loader_thread.start()
         
-        # Start processing threads for each device
+        # Wait for cache to reach initial fill before starting GPU processing
+        console.print(f"[yellow]Waiting for cache to fill to {page_cache.initial_fill_size} pages...[/yellow]")
+        cache_ready = page_cache.wait_until_ready(timeout=300)  # 5 minute timeout
+        
+        if not cache_ready:
+            console.print(f"[red]Warning: Cache pre-fill timeout. Starting processing anyway...[/red]")
+        
+        # Now start processing threads
+        console.print(f"[bold green]Starting {len(device_list)} GPU processing thread(s)...[/bold green]")
         threads = []
         for idx, (device, models) in enumerate(zip(device_list, models_per_device)):
             th = threading.Thread(
                 target=gpu_process_batches_streaming,
                 args=(
-                    document_queues[device],
+                    page_cache,
                     models["page_elements"],
                     models["table_structure"],
                     models["graphic_elements"],
@@ -852,7 +1038,6 @@ def run(
                     pages_counter,
                     counter_lock,
                     t_process_start,
-                    page_semaphores[device],
                 ),
             )
             threads.append(th)
@@ -873,7 +1058,10 @@ def run(
         load_time = t_load_end - t_load_start
         timings_per_device[0]["io_load"] = load_time
         
+        # Display cache and loader stats
+        cache_stats = page_cache.get_stats()
         console.print(f"[green]Loader stats: {loader_stats}[/green]")
+        console.print(f"[green]Cache stats: {cache_stats['total_loaded']} pages loaded, {cache_stats['total_consumed']} consumed[/green]")
         
     else:
         # --- LOAD ALL MODE: Original behavior ---

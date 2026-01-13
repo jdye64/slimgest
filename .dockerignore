@@ -4,8 +4,20 @@ models/*
 # But include the nemotron-ocr wheel file
 !models/nemotron-ocr-v1/
 !models/nemotron-ocr-v1/nemotron-ocr/
-!models/nemotron-ocr-v1/nemotron-ocr/dist/
+!models/nemotron-ocr-v1/nemotron-ocr/dist/  
 !models/nemotron-ocr-v1/nemotron-ocr/dist/nemotron_ocr-1.0.0-py3-none-any.whl
+!models/nemotron-graphic-elements-v1/
+!models/nemotron-graphic-elements-v1/nemotron-graphic-elements-v1/
+!models/nemotron-graphic-elements-v1/nemotron-graphic-elements-v1/dist/
+!models/nemotron-graphic-elements-v1/nemotron-graphic-elements-v1/dist/nemotron_graphic_elements_v1-1.0.0-py3-none-any.whl
+!models/nemotron-table-structure-v1/
+!models/nemotron-table-structure-v1/nemotron-table-structure-v1/
+!models/nemotron-table-structure-v1/nemotron-table-structure-v1/dist/
+!models/nemotron-table-structure-v1/nemotron-table-structure-v1/dist/nemotron_table_structure_v1-1.0.0-py3-none-any.whl
+!models/nemotron-page-elements-v3/
+!models/nemotron-page-elements-v3/nemotron-page-elements-v3/
+!models/nemotron-page-elements-v3/nemotron-page-elements-v3/dist/
+!models/nemotron-page-elements-v3/nemotron-page-elements-v3/dist/nemotron_page_elements_v3-3.0.0-py3-none-any.whl
 
 # Python cache
 __pycache__/

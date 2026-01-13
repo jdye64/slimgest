@@ -62,6 +62,18 @@ spec:
         {{- end }}
         resources:
           {{- toYaml .Values.resources | nindent 12 }}
+        volumeMounts:
+            - mountPath: /mnt/data
+              name: shared-storage
+            - mountPath: /dev/shm
+              name: dshm
+      volumes:
+        - name: shared-storage
+          persistentVolumeClaim:
+            claimName: datasets-pvc
+        - name: dshm
+          emptyDir:
+            medium: Memory
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
