@@ -10,7 +10,7 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       python3.12 python3.12-venv python3.12-dev \
       git curl ca-certificates build-essential \
-      libgl1 libglib2.0-0 libgomp1 && \
+      libgl1 libglib2.0-0 libgomp1 tmux vim && \
     rm -rf /var/lib/apt/lists/*
 
 # Ensure python/pip aliases point to python3.12
