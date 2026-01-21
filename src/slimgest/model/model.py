@@ -83,3 +83,18 @@ class HuggingFaceModel(BaseModel):
     def input_shape(self) -> Tuple[int, int]:
         """Input shape."""
         pass
+
+
+class NvidiaNIMModel(BaseModel):
+    """
+    Abstract base class for all Nvidia NIM models.
+    """
+
+    def __init__(self, model_id: str) -> None:
+        super().__init__()
+
+    @property
+    @abstractmethod
+    def model_dir(self) -> str:
+        """Model directory."""
+        pass

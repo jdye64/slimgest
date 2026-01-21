@@ -18,6 +18,7 @@ from slimgest.model.local.nemotron_ocr_v1 import NemotronOCRV1
 import typer
 
 # Import our new PDF processing utilities
+from slimgest.model.nim.nemotron_page_elements_v3_nim import NemotronPageElementsV3NIM
 from slimgest.pdf.render import iter_pdf_page_tensors
 from slimgest.pdf.tensor_ops import crop_tensor_with_bbox
 
@@ -57,6 +58,7 @@ def process_pdf_pages(
         with torch.inference_mode():
             resized_tensor = page_elements.preprocess(tensor)
             preds = page_elements.invoke(resized_tensor, bitmap_shape)
+            #preds = page_elements.invoke(resized_tensor)
             boxes, labels, scores = page_elements.postprocess(preds)
             
             # Process detected elements (tables and graphics)
@@ -198,7 +200,7 @@ def run(
         ]
 
     console.print(f"Processing {len(pdf_files)} PDFs")
-    console.print(f"Using page_elements_model device: {page_elements.model.device}")
+    # console.print(f"Using page_elements_model device: {page_elements.model.device}")
     # console.print(f"Using table_structure_model device: {table_structure_model.device}")
     # console.print(f"Using graphic_elements_model device: {graphic_elements_model.device}")
 
@@ -210,5 +212,3 @@ def run(
         ocr,
         raw_output_dir=raw_output_dir,
     )
-
-    console.print("[bold green]Done![/bold green]")
