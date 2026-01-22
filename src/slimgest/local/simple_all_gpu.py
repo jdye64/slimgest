@@ -307,6 +307,10 @@ def run_pipeline(
 
     vdb_op.run(results)
 
+    with open("results_bo767.pkl", "wb") as f:
+        import pickle
+        pickle.dump(results, f)
+
 
     elapsed = time.time() - start_time
     console.print(
