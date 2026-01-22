@@ -29,12 +29,7 @@ class NemotronOCRV1(BaseModel):
     def invoke(self, input_data: torch.Tensor) -> List[Dict[str, torch.Tensor]]:
         # Conditionally check and make sure the input data is on the correct device and shape
         results = self._model(input_data)
-        print(f"Type of results: {type(results)}")
-        print(f"Length of results: {len(results)}")
-        if isinstance(results, list) and len(results) > 0:
-            return results[0]
-        else:
-            return []
+        return results
 
     def postprocess(self, preds: List[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         boxes, labels, scores = postprocess_preds_page_element(

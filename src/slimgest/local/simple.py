@@ -15,6 +15,8 @@ from slimgest.model.local.nemotron_table_structure_v1 import NemotronTableStruct
 from slimgest.model.local.nemotron_graphic_elements_v1 import NemotronGraphicElementsV1
 from slimgest.model.local.nemotron_ocr_v1 import NemotronOCRV1
 
+import llama_nemotron_embed_1b_v2
+
 import typer
 
 # Import our new PDF processing utilities
@@ -33,6 +35,8 @@ def process_pdf_pages(
     table_structure,
     graphic_elements,
     ocr,
+    tokenizer,
+    embedding_model,
     device="cuda",
     dpi=150.0,
 ):
@@ -51,14 +55,12 @@ def process_pdf_pages(
         page_number = page_tensor_info.page_number
         tensor = page_tensor_info.tensor  # Shape: [3, H, W]
         bitmap_shape = (page_tensor_info.original_height, page_tensor_info.original_width)
-        
-        page_ocr_results = []
-        page_raw_ocr_results = []
+
+        ocr_results = []
         
         with torch.inference_mode():
             resized_tensor = page_elements.preprocess(tensor)
             preds = page_elements.invoke(resized_tensor, bitmap_shape)
-            #preds = page_elements.invoke(resized_tensor)
             boxes, labels, scores = page_elements.postprocess(preds)
             
             # Process detected elements (tables and graphics)
@@ -81,15 +83,18 @@ def process_pdf_pages(
             # Run OCR on the original (un-resized) tensor
             ocr_preds = ocr.invoke(tensor)
 
-            if isinstance(ocr_preds, list):
-                for pred in ocr_preds:
-                    page_ocr_results.append(str(pred['text']))
-                    page_raw_ocr_results.append(str(pred))
-            else:
-                page_ocr_results.append(str(ocr_preds['text']))
-                page_raw_ocr_results.append(str(ocr_preds))
+            for pred in ocr_preds:
+                ocr_results.append(str(pred['text']))
+
+            batch_documents = tokenizer(
+                " ".join(ocr_results), padding=True, truncation=True, return_tensors='pt'
+            ).to("cuda")
+
+            # print(f"Batch Documents: {batch_documents}")
+
+            embedding_result = embedding_model(**batch_documents)
         
-        yield page_number, resized_tensor, page_ocr_results, page_raw_ocr_results
+        yield page_number, resized_tensor, ocr_results, embedding_result
 
 def run_pipeline(
     pdf_files: List[str],
@@ -97,6 +102,8 @@ def run_pipeline(
     table_structure: NemotronTableStructureV1,
     graphic_elements: NemotronGraphicElementsV1,
     ocr: NemotronOCRV1,
+    tokenizer,
+    embedding_model,
     raw_output_dir: Optional[Path] = None,
     dpi: float = 150.0,
 ):
@@ -113,12 +120,14 @@ def run_pipeline(
         pages_in_pdf = 0
         
         # Process pages one at a time using the generator
-        for page_number, tensor, page_ocr_results, page_raw_ocr_results in process_pdf_pages(
+        for page_number, tensor, page_ocr_results, embedding_results in process_pdf_pages(
             pdf_path,
             page_elements,
             table_structure,
             graphic_elements,
             ocr,
+            tokenizer,
+            embedding_model,
             device="cuda",
             dpi=dpi,
         ):
@@ -127,14 +136,14 @@ def run_pipeline(
             
             # Collect OCR results
             all_page_ocr_results.extend(page_ocr_results)
-            all_page_raw_ocr_results.extend(page_raw_ocr_results)
+            # all_page_raw_ocr_results.extend(page_raw_ocr_results)
             
-            # Show progress
-            console.print(
-                f"  Processed page {page_number} | "
-                f"Tensor shape: {list(tensor.shape)} | "
-                f"Device: {tensor.device}"
-            )
+            # # Show progress
+            # console.print(
+            #     f"  Processed page {page_number} | "
+            #     f"Tensor shape: {list(tensor.shape)} | "
+            #     f"Device: {tensor.device}"
+            # )
         
         # Summary for this PDF
         console.print(
@@ -146,7 +155,12 @@ def run_pipeline(
         
         # Combine all OCR results for this PDF
         ocr_final_result = " ".join(all_page_ocr_results)
-        console.print(f"OCR final result: {ocr_final_result}", markup=False)
+        # console.print(f"OCR final result: {ocr_final_result}", markup=False)
+
+        # Dictionary with results ...
+        page_results = {
+            "text": ocr_final_result
+        }
         
         # Save raw OCR results if requested
         if raw_output_dir is not None:
@@ -155,8 +169,13 @@ def run_pipeline(
             pdf_path_obj = Path(pdf_path)
             output_json_path = raw_output_dir / pdf_path_obj.with_suffix('.page_raw_ocr_results.json').name
             with open(output_json_path, "w", encoding="utf-8") as f:
-                json.dump(all_page_raw_ocr_results, f, ensure_ascii=False, indent=2)
-            console.print(f"Saved page_raw_ocr_results to {output_json_path}")
+                json.dump(page_results, f, ensure_ascii=False, indent=2)
+
+        # Save embedding_results to a .pt file with torch if requested
+        if raw_output_dir is not None and 'embedding_results' in locals():
+            pdf_path_obj = Path(pdf_path)
+            embedding_output_path = raw_output_dir / pdf_path_obj.with_suffix('.embedding_results.pt').name
+            torch.save(embedding_results, embedding_output_path)
         
         # Store results for this PDF
         results.append({
@@ -189,6 +208,9 @@ def run(
     table_structure = NemotronTableStructureV1()
     graphic_elements = NemotronGraphicElementsV1()
     ocr = NemotronOCRV1(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints")
+    tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer()
+    embedding_model = llama_nemotron_embed_1b_v2.load_model(device="cuda")
+
 
     
     if input_dir.is_file():
@@ -200,9 +222,6 @@ def run(
         ]
 
     console.print(f"Processing {len(pdf_files)} PDFs")
-    # console.print(f"Using page_elements_model device: {page_elements.model.device}")
-    # console.print(f"Using table_structure_model device: {table_structure_model.device}")
-    # console.print(f"Using graphic_elements_model device: {graphic_elements_model.device}")
 
     run_pipeline(
         pdf_files,
@@ -210,5 +229,7 @@ def run(
         table_structure,
         graphic_elements,
         ocr,
+        tokenizer,
+        embedding_model,
         raw_output_dir=raw_output_dir,
     )
