@@ -9,6 +9,9 @@ import json
 import io
 from PIL import Image
 import numpy as np
+import torch.nn.functional as F
+
+from slimgest.local.vdb.lancedb import LanceDB
 
 from nemotron_page_elements_v3.model import define_model as define_model_page_elements
 from nemotron_page_elements_v3.model import resize_pad as resize_pad_page_elements
@@ -17,17 +20,73 @@ from nemotron_table_structure_v1.model import define_model as define_model_table
 from nemotron_table_structure_v1.model import resize_pad as resize_pad_table_structure
 from nemotron_graphic_elements_v1.model import define_model as define_model_graphic_elements
 from nemotron_graphic_elements_v1.model import resize_pad as resize_pad_graphic_elements
+
 from nemotron_ocr.inference.pipeline import NemotronOCR
+import llama_nemotron_embed_1b_v2
 
 import typer
 
 # Import our new PDF processing utilities
 from slimgest.pdf.render import iter_pdf_page_tensors
 from slimgest.pdf.tensor_ops import crop_tensor_with_bbox
+import os
 
 app = typer.Typer(help="Simpliest pipeline with limited CPU parallelism while using maximum GPU possible")
 install(show_locals=False)
 console = Console()
+
+
+
+def calculate_recall(real_answers, retrieved_answers, k):
+    hits = 0
+    for real, retrieved in zip(real_answers, retrieved_answers):
+        if real in retrieved[:k]:
+            hits += 1
+    return hits / len(real_answers)
+
+
+def calcuate_recall_list(real_answers, retrieved_answers, ks=[1, 3, 5, 10]):
+    recall_scores = {}
+    for k in ks:
+        recall_scores[k] = calculate_recall(real_answers, retrieved_answers, k)
+    return recall_scores
+
+def get_correct_answers(query_df):
+    retrieved_pdf_pages = []
+    for i in range(len(query_df)):
+        retrieved_pdf_pages.append(query_df['pdf_page'][i]) 
+    return retrieved_pdf_pages
+
+def create_lancedb_results(results):
+    old_results = [res["metadata"] for result in results for res in result]
+    results = []
+    for result in old_results:
+        if result["embedding"] is None:
+            continue
+        results.append({
+            "vector": result["embedding"], 
+            "text": result["content"], 
+            "metadata": result["content_metadata"]["page_number"], 
+            "source": result["source_metadata"]["source_id"],
+        })
+    return results
+
+def format_retrieved_answers_lance(all_answers):
+    retrieved_pdf_pages = []
+    for answers in all_answers:
+        retrieved_pdfs = [os.path.basename(result['source']).split('.')[0] for result in answers]
+        retrieved_pages = [str(result['metadata']) for result in answers]
+        retrieved_pdf_pages.append([f"{pdf}_{page}" for pdf, page in zip(retrieved_pdfs, retrieved_pages)])
+    return retrieved_pdf_pages
+
+
+
+def average_pool(last_hidden_states, attention_mask):
+    """Average pooling with attention mask."""
+    last_hidden_states_masked = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+    embedding = last_hidden_states_masked.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+    embedding = F.normalize(embedding, dim=-1)
+    return embedding
 
 
 def tensor_to_pil_image(tensor):
@@ -52,6 +111,8 @@ def process_pdf_pages(
     table_structure_model,
     graphic_element_model,
     ocr_model,
+    embed_model,
+    embed_tokenizer,
     device="cuda",
     dpi=150.0,
 ):
@@ -67,6 +128,7 @@ def process_pdf_pages(
     page_elements_input_shape = (1024, 1024)
     table_structure_input_shape = (1024, 1024)
     graphic_elements_input_shape = (1024, 1024)
+    result_rows = []
     
     # Use the new generator to iterate through PDF pages
     for page_tensor_info in iter_pdf_page_tensors(pdf_path, dpi=dpi, device=device):
@@ -76,7 +138,7 @@ def process_pdf_pages(
         
         # Keep a reference to the original tensor for OCR
         original_tensor = tensor
-        
+        embeddings = []
         page_ocr_results = []
         page_raw_ocr_results = []
         
@@ -97,7 +159,7 @@ def process_pdf_pages(
                     crop_shape = (cropped.shape[1], cropped.shape[2])
                     cropped_resized = resize_pad_table_structure(cropped, table_structure_input_shape)
                     table_preds = table_structure_model(cropped_resized, crop_shape)[0]
-                    print(f"Page {page_number} - Table structure results: {table_preds}")
+                    # print(f"Page {page_number} - Table structure results: {table_preds}")
                     
                 elif label in [1, 2, 3]:  # Graphic elements
                     cropped = crop_tensor_with_bbox(
@@ -106,7 +168,7 @@ def process_pdf_pages(
                     crop_shape = (cropped.shape[1], cropped.shape[2])
                     cropped_resized = resize_pad_graphic_elements(cropped, graphic_elements_input_shape)
                     graphic_preds = graphic_element_model(cropped_resized, crop_shape)[0]
-                    print(f"Page {page_number} - Graphic elements results: {graphic_preds}")
+                    # print(f"Page {page_number} - Graphic elements results: {graphic_preds}")
             
             # Run OCR on the original (un-resized) tensor
             # Convert the tensor to a PIL image, then to a BytesIO JPEG for OCR model
@@ -119,8 +181,22 @@ def process_pdf_pages(
             for pred in ocr_preds:
                 page_ocr_results.append(str(pred['text']))
                 page_raw_ocr_results.append(str(pred))
-        
-        yield page_number, resized_tensor, page_ocr_results, page_raw_ocr_results
+            
+            if len(page_ocr_results) > 0:
+                tokenized_inputs = embed_tokenizer(page_ocr_results, return_tensors="pt", padding=True).to(device)
+                embed_model_results = embed_model(**tokenized_inputs)
+                # breakpoint()
+                embeddings.append(average_pool(embed_model_results.last_hidden_state, tokenized_inputs['attention_mask']))
+
+        result_rows.append({
+            "pdf_path": pdf_path,
+            "page_number": page_number,
+            "resized_tensor": resized_tensor,
+            "page_ocr_results": page_ocr_results,
+            "page_raw_ocr_results": page_raw_ocr_results,
+            "embeddings": embeddings
+        })
+    return result_rows
 
 def run_pipeline(
     pdf_files: List[str],
@@ -128,6 +204,9 @@ def run_pipeline(
     table_structure_model: nn.Module,
     graphic_elements_model: nn.Module,
     ocr_model: NemotronOCR,
+    embed_model: nn.Module,
+    embed_tokenizer: nn.Module,
+    vdb_op: None,
     raw_output_dir: Optional[Path] = None,
     dpi: float = 150.0,
     return_results: bool = False,
@@ -145,6 +224,9 @@ def run_pipeline(
     Returns:
         If return_results is True, returns a dict with all results.
     """
+    console.print(f"made ti to run pipeline")
+
+    pdf_files = [pdf_files] if isinstance(pdf_files, str) else pdf_files
     start_time = time.time()
     total_pages_processed = 0
     results = []
@@ -156,42 +238,58 @@ def run_pipeline(
         all_page_ocr_results = []
         all_page_raw_ocr_results = []
         pages_in_pdf = 0
-        
+
         # Process pages one at a time using the generator
-        for page_number, tensor, page_ocr_results, page_raw_ocr_results in process_pdf_pages(
+        for results_row in process_pdf_pages(
             pdf_path,
             page_elements_model,
             table_structure_model,
             graphic_elements_model,
             ocr_model,
+            embed_model,
+            embed_tokenizer,
             device="cuda",
             dpi=dpi,
         ):
+            page_number = results_row["page_number"]
+            page_ocr_results = results_row["page_ocr_results"]
+            page_raw_ocr_results = results_row["page_raw_ocr_results"]
+            embeddings = results_row["embeddings"]
             pages_in_pdf += 1
             total_pages_processed += 1
             
             # Collect OCR results
             all_page_ocr_results.extend(page_ocr_results)
             all_page_raw_ocr_results.extend(page_raw_ocr_results)
-            
-            # Show progress
-            console.print(
-                f"  Processed page {page_number} | "
-                f"Tensor shape: {list(tensor.shape)} | "
-                f"Device: {tensor.device}"
-            )
+            # all_embeddings.append(list(embed) for embed in embeddings[0])
+            # breakpoint()
+            for embedding in embeddings:
+                for text, ocr, embed in zip(page_ocr_results, page_raw_ocr_results, embedding):
+                    results.append({
+                        "source_id": pdf_path,
+                        "page_number": page_number,
+                        "content": text,
+                        "raw_ocr_results": ocr,
+                        "embedding": embed.cpu().numpy().astype(np.float32),
+                    })
+            # # Show progress
+            # console.print(
+            #     f"  Processed page {page_number} | "
+            #     f"Tensor shape: {list(tensor.shape)} | "
+            #     f"Device: {tensor.device}"
+            # )
         
-        # Summary for this PDF
-        console.print(
-            f"Completed {pages_in_pdf} pages from {pdf_path}. "
-            f"PDF {pdf_idx} of {len(pdf_files)}. "
-            f"Total pages processed: {total_pages_processed}. "
-            f"Current Runtime: {time.time() - start_time:.2f} seconds"
-        )
+        # # Summary for this PDF
+        # console.print(
+        #     f"Completed {pages_in_pdf} pages from {pdf_path}. "
+        #     f"PDF {pdf_idx} of {len(pdf_files)}. "
+        #     f"Total pages processed: {total_pages_processed}. "
+        #     f"Current Runtime: {time.time() - start_time:.2f} seconds"
+        # )
         
-        # Combine all OCR results for this PDF
-        ocr_final_result = " ".join(all_page_ocr_results)
-        console.print(f"OCR final result: {ocr_final_result}", markup=False)
+        # # Combine all OCR results for this PDF
+        # ocr_final_result = " ".join(all_page_ocr_results)
+        # console.print(f"OCR final result: {ocr_final_result}", markup=False)
         
         # Save raw OCR results if requested
         if raw_output_dir is not None:
@@ -204,13 +302,16 @@ def run_pipeline(
             console.print(f"Saved page_raw_ocr_results to {output_json_path}")
         
         # Store results for this PDF
-        results.append({
-            "pdf_path": pdf_path,
-            "pages_processed": pages_in_pdf,
-            "ocr_text": ocr_final_result,
-            "raw_ocr_results": all_page_raw_ocr_results,
-        })
-    
+
+    # add to vdb
+
+    vdb_op.run(results)
+
+    with open("results_bo767.pkl", "wb") as f:
+        import pickle
+        pickle.dump(results, f)
+
+
     elapsed = time.time() - start_time
     console.print(
         f"[bold green]Processed {total_pages_processed} pages from {len(pdf_files)} PDF(s) "
@@ -235,8 +336,9 @@ def run(
     page_elements_model = define_model_page_elements("page_element_v3")
     table_structure_model = define_model_table_structure("table_structure_v1")
     graphic_elements_model = define_model_graphic_elements("graphic_elements_v1")
-    ocr_model = NemotronOCR(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints")
-
+    ocr_model = NemotronOCR(model_dir="/root/.cache/huggingface/hub/models--nvidia--nemotron-ocr-v1/snapshots/90015d3b851ba898ca842f18e948690af49c2427/checkpoints")
+    embed_model = llama_nemotron_embed_1b_v2.load_model('cuda:0', True, None, True)
+    embed_tokenzier = llama_nemotron_embed_1b_v2.load_tokenizer("longest_first")
     
     if input_dir.is_file():
         pdf_files = [input_dir]
@@ -257,14 +359,45 @@ def run(
         console.print(f"[bold yellow]{i}[/bold yellow]", end='\r')
         time.sleep(1)
     console.print("[bold green]Go![/bold green]")
-
-    run_pipeline(
-        pdf_files,
+    start = time.time()
+    vdb_op = LanceDB(uri="./slimgest_lancedb_simple_all_gpu")
+    pipe_results = run_pipeline(
+        pdf_files[:],
         page_elements_model,
         table_structure_model,
         graphic_elements_model,
         ocr_model,
+        embed_model,
+        embed_tokenzier,
+        vdb_op=vdb_op,
         raw_output_dir=raw_output_dir,
+        return_results=True,
     )
+    end = time.time()
+    console.print(f"Total time: {end - start:.2f} seconds")
+    # results = pipe_results["results"]
+    import pandas as pd
+    df_query = pd.read_csv('/raid/nv-ingest/data/bo767_query_gt.csv').rename(columns={'gt_page':'page'})[['query','pdf','page']]
+    df_query['pdf_page'] = df_query.apply(lambda x: f"{x.pdf}_{x.page}", axis=1) 
+    
+    all_answers = []
+    query_texts = df_query['query'].tolist()
+    top_k = 10
+    result_fields = ["source", "metadata", "text"]
+    query_embeddings = []
+    for query_batch in query_texts:
+        query_tokens = embed_tokenzier(query_batch, return_tensors="pt", padding=True).to('cuda')
+        query_model_results = embed_model(**query_tokens)
+        query_embeddings += average_pool(query_model_results.last_hidden_state, query_tokens['attention_mask'])
+    for query_embed in query_embeddings:
+        all_answers.append(
+            vdb_op.table.search([query_embed.detach().cpu().numpy()], vector_column_name="vector").select(result_fields).limit(top_k).to_list()
+        )
+    retrieved_pdf_pages = format_retrieved_answers_lance(all_answers)
+    golden_answers = get_correct_answers(df_query)
+    recall_scores = calcuate_recall_list(golden_answers, retrieved_pdf_pages, ks=[1, 3, 5, 10])
 
+    console.print(f"number of chunks: {len(retrieved_pdf_pages)}")reay
+    console.print("Recall scores:")
+    console.print(recall_scores)
     console.print("[bold green]Done![/bold green]")
