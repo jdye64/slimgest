@@ -270,7 +270,7 @@ def run_pipeline(
                         "page_number": page_number,
                         "content": text,
                         "raw_ocr_results": ocr,
-                        "embedding": embed.cpu().numpy().astype("int8"),
+                        "embedding": embed.cpu().numpy().astype(np.float32),
                     })
             # # Show progress
             # console.print(
@@ -394,9 +394,10 @@ def run(
             vdb_op.table.search([query_embed.detach().cpu().numpy()], vector_column_name="vector").select(result_fields).limit(top_k).to_list()
         )
     retrieved_pdf_pages = format_retrieved_answers_lance(all_answers)
-    golden_answers = get_correct_answers(df_query)    
+    golden_answers = get_correct_answers(df_query)
     recall_scores = calcuate_recall_list(golden_answers, retrieved_pdf_pages, ks=[1, 3, 5, 10])
 
+    console.print(f"number of chunks: {len(retrieved_pdf_pages)}")reay
     console.print("Recall scores:")
     console.print(recall_scores)
     console.print("[bold green]Done![/bold green]")
