@@ -20,7 +20,7 @@ from nemotron_table_structure_v1.model import define_model as define_model_table
 from nemotron_graphic_elements_v1.model import define_model as define_model_graphic_elements
 from nemotron_ocr.inference.pipeline import NemotronOCR
 
-from slimgest.local.simple_all_gpu import run_pipeline, process_pdf_pages
+from slimgest.local.simple import run_pipeline, process_pdf_pages
 
 
 # Global models - initialized on startup

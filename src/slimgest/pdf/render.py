@@ -40,6 +40,12 @@ class PageBitmap:
 
 
 @dataclass
+class PageBitmapWithText(PageBitmap):
+    """Rendered bitmap plus raw PDF-extracted text for a single page."""
+    text: str
+
+
+@dataclass
 class PageTensor:
     """Metadata and tensor for a single PDF page."""
     page_number: int  # 0-indexed
@@ -54,7 +60,7 @@ def iter_pdf_page_bitmaps(
     dpi: float = 150.0,
     rotation: int = 0,
     grayscale: bool = False,
-) -> Generator[PageBitmap, None, None]:
+) -> Generator[PageBitmapWithText, None, None]:
     """
     Generator that yields rendered bitmaps for each page in a PDF.
     
@@ -69,12 +75,12 @@ def iter_pdf_page_bitmaps(
         grayscale: If True, render in grayscale instead of RGB.
     
     Yields:
-        PageBitmap objects containing the rendered bitmap and metadata.
+        PageBitmapWithText objects containing the rendered bitmap, metadata, and extracted text.
     
     Example:
         >>> for page_bitmap in iter_pdf_page_bitmaps("document.pdf", dpi=150):
         ...     arr = page_bitmap.to_numpy()
-        ...     print(f"Page {page_bitmap.page_number}: {arr.shape}")
+        ...     print(f"Page {page_bitmap.page_number}: {arr.shape}, text_len={len(page_bitmap.text)}")
     """
     pdf = pdfium.PdfDocument(pdf_path)
     try:
@@ -84,17 +90,31 @@ def iter_pdf_page_bitmaps(
         for page_idx in range(num_pages):
             page = pdf.get_page(page_idx)
             try:
+                # Extract raw embedded text (not OCR) using standard PDFium APIs
+                page_text = ""
+                try:
+                    textpage = page.get_textpage()
+                    try:
+                        page_text = textpage.get_text_range() or ""
+                    finally:
+                        close_fn = getattr(textpage, "close", None)
+                        if callable(close_fn):
+                            close_fn()
+                except Exception:
+                    page_text = ""
+
                 bitmap = page.render(
                     scale=scale,
                     rotation=rotation,
                     grayscale=grayscale
                 )
                 
-                yield PageBitmap(
+                yield PageBitmapWithText(
                     page_number=page_idx,
                     bitmap=bitmap,
                     width=bitmap.width,
                     height=bitmap.height,
+                    text=page_text,
                 )
             finally:
                 page.close()
