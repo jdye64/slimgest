@@ -131,7 +131,7 @@ for i, crop in enumerate(crops):
 
 #### `iter_pdf_page_bitmaps(pdf_path, dpi=150.0, rotation=0, grayscale=False)`
 
-Generator that yields `PageBitmap` objects for each page.
+Generator that yields `PageBitmapWithText` objects for each page.
 
 **Parameters:**
 - `pdf_path`: Path to PDF file
@@ -139,10 +139,11 @@ Generator that yields `PageBitmap` objects for each page.
 - `rotation`: Rotation angle in degrees (0, 90, 180, 270)
 - `grayscale`: If True, render in grayscale
 
-**Yields:** `PageBitmap` with attributes:
+**Yields:** `PageBitmapWithText` with attributes:
 - `page_number`: 0-indexed page number
 - `bitmap`: pypdfium2 bitmap object
 - `width`, `height`: Bitmap dimensions
+- `text`: Raw embedded text extracted from the PDF page via PDFium (not OCR)
 - `to_numpy()`: Method to convert to numpy array
 
 #### `iter_pdf_page_tensors(pdf_path, dpi=150.0, device="cpu", dtype=torch.uint8, ...)`

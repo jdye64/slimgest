@@ -221,8 +221,11 @@ def topk(
 
     # Load embedding model once
     dev = torch.device(device)
-    tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer()
-    model = llama_nemotron_embed_1b_v2.load_model(device=str(dev))
+    hf_cache_dir = str(Path.home() / ".cache" / "huggingface")
+    tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer(cache_dir=hf_cache_dir, force_download=False)
+    model = llama_nemotron_embed_1b_v2.load_model(
+        device=str(dev), trust_remote_code=True, cache_dir=hf_cache_dir, force_download=False
+    )
     model.eval()
 
     if not queries_csv.exists():

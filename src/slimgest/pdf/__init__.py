@@ -4,6 +4,7 @@ from .render import (
     iter_pdf_page_tensors,
     load_pdf_page_tensors,
     PageBitmap,
+    PageBitmapWithText,
     PageTensor,
 )
 from .tensor_ops import (
@@ -20,6 +21,7 @@ __all__ = [
     "iter_pdf_page_tensors",
     "load_pdf_page_tensors",
     "PageBitmap",
+    "PageBitmapWithText",
     "PageTensor",
     # Tensor operations
     "crop_tensor_with_bbox",
