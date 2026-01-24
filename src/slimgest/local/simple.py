@@ -8,6 +8,8 @@ import time
 import json
 import numpy as np
 import pypdfium2 as pdfium
+import os
+from slimgest.local.vdb.lancedb import LanceDB
 
 from slimgest.model.local.nemotron_page_elements_v3 import NemotronPageElementsV3
 from slimgest.model.local.nemotron_table_structure_v1 import NemotronTableStructureV1
@@ -23,6 +25,62 @@ from slimgest.pdf.render import iter_pdf_page_tensors
 app = typer.Typer(help="Simpliest pipeline with limited CPU parallelism while using maximum GPU possible")
 install(show_locals=False)
 console = Console()
+
+
+
+
+def calculate_recall(real_answers, retrieved_answers, k):
+    hits = 0
+    for real, retrieved in zip(real_answers, retrieved_answers):
+        if real in retrieved[:k]:
+            hits += 1
+    return hits / len(real_answers)
+
+
+def calcuate_recall_list(real_answers, retrieved_answers, ks=[1, 3, 5, 10]):
+    recall_scores = {}
+    for k in ks:
+        recall_scores[k] = calculate_recall(real_answers, retrieved_answers, k)
+    return recall_scores
+
+def get_correct_answers(query_df):
+    retrieved_pdf_pages = []
+    for i in range(len(query_df)):
+        retrieved_pdf_pages.append(query_df['pdf_page'][i]) 
+    return retrieved_pdf_pages
+
+def create_lancedb_results(results):
+    old_results = [res["metadata"] for result in results for res in result]
+    results = []
+    for result in old_results:
+        if result["embedding"] is None:
+            continue
+        results.append({
+            "vector": result["embedding"], 
+            "text": result["content"], 
+            "metadata": result["content_metadata"]["page_number"], 
+            "source": result["source_metadata"]["source_id"],
+        })
+    return results
+
+def format_retrieved_answers_lance(all_answers):
+    retrieved_pdf_pages = []
+    for answers in all_answers:
+        retrieved_pdfs = [os.path.basename(result['source']).split('.')[0] for result in answers]
+        retrieved_pages = [str(result['metadata']) for result in answers]
+        retrieved_pdf_pages.append([f"{pdf}_{page}" for pdf, page in zip(retrieved_pdfs, retrieved_pages)])
+    return retrieved_pdf_pages
+
+
+
+def average_pool(last_hidden_states, attention_mask):
+    """Average pooling with attention mask."""
+    last_hidden_states_masked = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+    embedding = last_hidden_states_masked.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+    embedding = F.normalize(embedding, dim=-1)
+    return embedding
+
+
 
 def _empty_run_metrics() -> Dict[str, Any]:
     return {
@@ -280,20 +338,21 @@ def process_pdf_pages(
     """
     
     pdf = pdfium.PdfDocument(pdf_path)
+    print(f"Opened PDF: {pdf_path}")
     try:
         # Use the generator to iterate through rendered PDF pages
         for page_tensor_info in iter_pdf_page_tensors(pdf_path, dpi=dpi, device=device):
             page_t0 = time.perf_counter()
-            page_metrics = _empty_run_metrics()
-            page_metrics["pages_processed"] = 1
+            # page_metrics = _empty_run_metrics()
+            # page_metrics["pages_processed"] = 1
 
             page_number = page_tensor_info.page_number
             tensor = page_tensor_info.tensor  # Shape: [3, H, W]
             bitmap_shape = (page_tensor_info.original_height, page_tensor_info.original_width)
 
-            t0 = time.perf_counter()
+            # t0 = time.perf_counter()
             page_text = _extract_pdfium_page_text(pdf, page_number)
-            page_metrics["timings"]["page_text"] += time.perf_counter() - t0
+            # page_metrics["timings"]["page_text"] += time.perf_counter() - t0
 
             # OCR is ONLY performed on detections from table_structure/graphic_elements.
             table_structure_text: List[str] = []
@@ -303,13 +362,13 @@ def process_pdf_pages(
 
             with torch.inference_mode():
                 # Page element detection to find candidate table/graphic regions
-                t0 = time.perf_counter()
+                # t0 = time.perf_counter()
                 det_input = page_elements.preprocess(tensor)
                 det_preds = page_elements.invoke(det_input, bitmap_shape)
                 boxes, labels, scores = page_elements.postprocess(det_preds)
-                dt = time.perf_counter() - t0
-                page_metrics["timings"]["page_elements"] += dt
-                _metrics_model_add(page_metrics, "page_elements", dt, items=1, calls=1)
+                # dt = time.perf_counter() - t0
+                # page_metrics["timings"]["page_elements"] += dt
+                # _metrics_model_add(page_metrics, "page_elements", dt, items=1, calls=1)
 
                 # Split into table regions vs graphic regions first (so we can micro-batch downstream work)
                 table_regions: List[Dict[str, Any]] = []
@@ -328,8 +387,8 @@ def process_pdf_pages(
                         region["crop"] = _crop_tensor_normalized_xyxy(tensor, box)
                         graphic_regions.append(region)
 
-                page_metrics["counts"]["table_regions"] += len(table_regions)
-                page_metrics["counts"]["graphic_regions"] += len(graphic_regions)
+                # page_metrics["counts"]["table_regions"] += len(table_regions)
+                # page_metrics["counts"]["graphic_regions"] += len(graphic_regions)
 
                 # Run table_structure in micro-batches (default 4), then queue OCR crops
                 ocr_tasks: List[Dict[str, Any]] = []
@@ -338,12 +397,12 @@ def process_pdf_pages(
                     for region in batch:
                         table_crop = region["crop"]
                         crop_shape = (int(table_crop.shape[1]), int(table_crop.shape[2]))
-                        t0 = time.perf_counter()
+                        # t0 = time.perf_counter()
                         ts_input = table_structure.preprocess(table_crop, crop_shape)
                         ts_preds = table_structure.invoke(ts_input, crop_shape)
-                        dt = time.perf_counter() - t0
-                        page_metrics["timings"]["table_structure"] += dt
-                        _metrics_model_add(page_metrics, "table_structure", dt, items=1, calls=1)
+                        # dt = time.perf_counter() - t0
+                        # page_metrics["timings"]["table_structure"] += dt
+                        # _metrics_model_add(page_metrics, "table_structure", dt, items=1, calls=1)
 
                         for det in _iter_detection_dicts(ts_preds):
                             det_boxes = det.get("boxes", [])
@@ -378,12 +437,12 @@ def process_pdf_pages(
                     for region in batch:
                         graphic_crop = region["crop"]
                         crop_shape = (int(graphic_crop.shape[1]), int(graphic_crop.shape[2]))
-                        t0 = time.perf_counter()
+                        # t0 = time.perf_counter()
                         ge_input = graphic_elements.preprocess(graphic_crop)
                         ge_preds = graphic_elements.invoke(ge_input, crop_shape)
-                        dt = time.perf_counter() - t0
-                        page_metrics["timings"]["graphic_elements"] += dt
-                        _metrics_model_add(page_metrics, "graphic_elements", dt, items=1, calls=1)
+                        # dt = time.perf_counter() - t0
+                        # page_metrics["timings"]["graphic_elements"] += dt
+                        # _metrics_model_add(page_metrics, "graphic_elements", dt, items=1, calls=1)
 
                         for det in _iter_detection_dicts(ge_preds):
                             det_boxes = det.get("boxes", [])
@@ -412,9 +471,9 @@ def process_pdf_pages(
                                     }
                                 )
 
-                page_metrics["counts"]["table_structure_detections"] += len(table_structure_detections)
-                page_metrics["counts"]["graphic_elements_detections"] += len(graphic_elements_detections)
-                page_metrics["counts"]["ocr_crops"] += len(ocr_tasks)
+                # page_metrics["counts"]["table_structure_detections"] += len(table_structure_detections)
+                # page_metrics["counts"]["graphic_elements_detections"] += len(graphic_elements_detections)
+                # page_metrics["counts"]["ocr_crops"] += len(ocr_tasks)
 
                 # OCR in batches (default 8). Try true batching; fall back to per-crop if unsupported.
                 for batch in _chunked(ocr_tasks, ocr_batch_size):
@@ -424,11 +483,11 @@ def process_pdf_pages(
 
                     batch_texts: List[str] = []
                     try:
-                        t0 = time.perf_counter()
+                        # t0 = time.perf_counter()
                         ocr_out = ocr.invoke(batch_tensor)
-                        dt = time.perf_counter() - t0
-                        page_metrics["timings"]["ocr"] += dt
-                        _metrics_model_add(page_metrics, "ocr", dt, items=len(batch), calls=1)
+                        # dt = time.perf_counter() - t0
+                        # page_metrics["timings"]["ocr"] += dt
+                        # _metrics_model_add(page_metrics, "ocr", dt, items=len(batch), calls=1)
                         # Common cases:
                         # - batched: list length B, each entry list[dict] or dict with 'text'
                         # - non-batched: list[dict] for single image (then we'll fallback)
@@ -448,11 +507,11 @@ def process_pdf_pages(
                         # Fallback: run OCR per crop (still chunked for progress/structure)
                         batch_texts = []
                         for t in batch:
-                            t0 = time.perf_counter()
+                            # t0 = time.perf_counter()
                             out = ocr.invoke(t["crop"])
-                            dt = time.perf_counter() - t0
-                            page_metrics["timings"]["ocr"] += dt
-                            _metrics_model_add(page_metrics, "ocr", dt, items=1, calls=1)
+                            # dt = time.perf_counter() - t0
+                            # page_metrics["timings"]["ocr"] += dt
+                            # _metrics_model_add(page_metrics, "ocr", dt, items=1, calls=1)
                             if isinstance(out, list):
                                 batch_texts.append(" ".join([str(p.get("text", "")) for p in out]).strip())
                             elif isinstance(out, dict):
@@ -470,31 +529,33 @@ def process_pdf_pages(
 
                 # Build embeddings in micro-batches (default 4) over text segments
                 text_segments = [t for t in [page_text] + table_structure_text + graphic_elements_text if t]
-                page_metrics["counts"]["embedding_segments"] += len(text_segments)
+                # page_metrics["counts"]["embedding_segments"] += len(text_segments)
                 embedding_results: List[Any] = []
                 for seg_batch in _chunked(text_segments, embedding_batch_size):
                     batch_documents = tokenizer(
                         seg_batch, padding=True, truncation=True, return_tensors="pt"
                     ).to("cuda")
-                    t0 = time.perf_counter()
+                    # t0 = time.perf_counter()
                     out = embedding_model(**batch_documents)
-                    dt = time.perf_counter() - t0
-                    page_metrics["timings"]["embedding"] += dt
-                    _metrics_model_add(page_metrics, "embedding", dt, items=len(seg_batch), calls=1)
-                    embedding_results.append(out)
-
-            page_metrics["timings"]["page_total"] += time.perf_counter() - page_t0
+                    # dt = time.perf_counter() - t0
+                    # page_metrics["timings"]["embedding"] += dt
+                    # _metrics_model_add(page_metrics, "embedding", dt, items=len(seg_batch), calls=1)
+                    pooling = average_pool(out.last_hidden_state, batch_documents["attention_mask"])
+                    embedding_results += np.split(pooling.cpu().numpy().astype(np.float32), pooling.shape[0], axis=0)
+            # page_metrics["timings"]["page_total"] += time.perf_counter() - page_t0
 
             yield (
                 page_number,
                 {
+                    "pdf_path": pdf_path,
+                    "page_number": page_number,
                     "page_text": page_text,
                     "table_structure_text": table_structure_text,
                     "graphic_elements_text": graphic_elements_text,
                     "table_structure_detections": table_structure_detections,
                     "graphic_elements_detections": graphic_elements_detections,
                     "embedding": embedding_results,
-                    "metrics": page_metrics,
+                    # "metrics": page_metrics,
                 },
             )
     finally:
@@ -543,62 +604,64 @@ def run_pipeline(
             total_pages_processed += 1
             pages.append(
                 {
+                    "source_id": pdf_path,
                     "page_number": int(page_number),
                     "page_text": page_result["page_text"],
                     "table_structure_text": page_result["table_structure_text"],
                     "graphic_elements_text": page_result["graphic_elements_text"],
                     "table_structure_detections": page_result["table_structure_detections"],
                     "graphic_elements_detections": page_result["graphic_elements_detections"],
+                    "embedding": page_result["embedding"],
                 }
             )
 
-            # Update metrics (per page + per pdf + global)
-            page_metrics = page_result.get("metrics") or _empty_run_metrics()
-            _metrics_add(pdf_metrics, page_metrics)
-            _metrics_add(run_metrics, page_metrics)
+            # # Update metrics (per page + per pdf + global)
+            # page_metrics = page_result.get("metrics") or _empty_run_metrics()
+            # _metrics_add(pdf_metrics, page_metrics)
+            # _metrics_add(run_metrics, page_metrics)
 
-            # Per-page progress logging (preview + detection counts)
-            ts_n = len(page_result.get("table_structure_detections", []) or [])
-            ge_n = len(page_result.get("graphic_elements_detections", []) or [])
-            preview_src = " ".join(
-                [
-                    (page_result.get("page_text") or "").replace("\n", " ").strip(),
-                    " ".join(page_result.get("table_structure_text", []) or []),
-                    " ".join(page_result.get("graphic_elements_text", []) or []),
-                ]
-            ).strip()
-            preview = (preview_src[:200] + ("…" if len(preview_src) > 200 else "")).strip()
-            console.print(
-                f"[cyan]Page[/cyan] {int(page_number) + 1} "
-                f"(idx={int(page_number)}): "
-                f"table_structure={ts_n}, graphic_elements={ge_n} | "
-                f"preview='{preview}'",
-                markup=True,
-                highlight=False,
-            )
+            # # Per-page progress logging (preview + detection counts)
+            # ts_n = len(page_result.get("table_structure_detections", []) or [])
+            # ge_n = len(page_result.get("graphic_elements_detections", []) or [])
+            # preview_src = " ".join(
+            #     [
+            #         (page_result.get("page_text") or "").replace("\n", " ").strip(),
+            #         " ".join(page_result.get("table_structure_text", []) or []),
+            #         " ".join(page_result.get("graphic_elements_text", []) or []),
+            #     ]
+            # ).strip()
+            # preview = (preview_src[:200] + ("…" if len(preview_src) > 200 else "")).strip()
+            # console.print(
+            #     f"[cyan]Page[/cyan] {int(page_number) + 1} "
+            #     f"(idx={int(page_number)}): "
+            #     f"table_structure={ts_n}, graphic_elements={ge_n} | "
+            #     f"preview='{preview}'",
+            #     markup=True,
+            #     highlight=False,
+            # )
 
             # Per-page metrics report (delta + cumulative totals)
-            _print_metrics_report(scope="Last page", metrics=page_metrics)
-            _print_metrics_report(scope="Cumulative run", metrics=run_metrics, total_expected_pages=expected_total_pages)
+            # _print_metrics_report(scope="Last page", metrics=page_metrics)
+            # _print_metrics_report(scope="Cumulative run", metrics=run_metrics, total_expected_pages=expected_total_pages)
 
             # Periodic ETA (every ~5 seconds by default)
-            now = time.time()
-            if (now - last_eta_print) >= float(eta_print_interval_seconds):
-                elapsed = now - start_time
-                rate = (total_pages_processed / elapsed) if elapsed > 0 else 0.0  # pages/sec
-                remaining_pages = max(0, int(expected_total_pages) - int(total_pages_processed))
-                eta_seconds = (remaining_pages / rate) if rate > 0 else float("inf")
+            # now = time.time()
+            # if (now - last_eta_print) >= float(eta_print_interval_seconds):
+            #     elapsed = now - start_time
+            #     rate = (total_pages_processed / elapsed) if elapsed > 0 else 0.0  # pages/sec
+            #     remaining_pages = max(0, int(expected_total_pages) - int(total_pages_processed))
+            #     eta_seconds = (remaining_pages / rate) if rate > 0 else float("inf")
 
-                console.print(
-                    f"[magenta]ETA[/magenta] elapsed={_fmt_secs(elapsed)} "
-                    f"processed={total_pages_processed}/{expected_total_pages} "
-                    f"rate={rate:.3f} pages/s "
-                    f"remaining={remaining_pages} "
-                    f"eta={_fmt_secs(eta_seconds)}",
-                    markup=True,
-                    highlight=False,
-                )
-                last_eta_print = now
+            #     # console.print(
+            #     #     f"[magenta]ETA[/magenta] elapsed={_fmt_secs(elapsed)} "
+            #     #     f"processed={total_pages_processed}/{expected_total_pages} "
+            #     #     f"rate={rate:.3f} pages/s "
+            #     #     f"remaining={remaining_pages} "
+            #     #     f"eta={_fmt_secs(eta_seconds)}",
+            #     #     markup=True,
+            #     #     highlight=False,
+            #     # )
+            #     # last_eta_print = now
             
         # Summary for this PDF
         console.print(
@@ -646,11 +709,19 @@ def run(
     input_dir: Path = typer.Argument(..., exists=True, file_okay=True),
     raw_output_dir: Optional[Path] = typer.Option(None, help="Directory to save raw OCR results (optional)."),
 ):
+    run_alone(input_dir, raw_output_dir)
+
+
+
+def run_alone(
+    input_dir: str = None,
+    raw_output_dir: str = None,
+):
     # Load Models
     page_elements = NemotronPageElementsV3()
     table_structure = NemotronTableStructureV1()
     graphic_elements = NemotronGraphicElementsV1()
-    ocr = NemotronOCRV1(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints")
+    ocr = NemotronOCRV1(model_dir="/root/.cache/huggingface/hub/models--nvidia--nemotron-ocr-v1/snapshots/90015d3b851ba898ca842f18e948690af49c2427/checkpoints")
     hf_cache_dir = str(Path.home() / ".cache" / "huggingface")
     tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer(cache_dir=hf_cache_dir, force_download=False)
     embedding_model = llama_nemotron_embed_1b_v2.load_model(
@@ -668,9 +739,10 @@ def run(
         ]
 
     console.print(f"Processing {len(pdf_files)} PDFs")
+    vdb_op = LanceDB(uri="./slimgest_lancedb_simple_all_gpu")
 
-    run_pipeline(
-        pdf_files,
+    results = run_pipeline(
+        pdf_files[:],
         page_elements,
         table_structure,
         graphic_elements,
@@ -679,3 +751,82 @@ def run(
         embedding_model,
         raw_output_dir=raw_output_dir,
     )
+    chunk_results = results['results']
+    text = []
+    graphics = []
+    tables = []
+    for result in chunk_results:
+        for page in result["pages"]:
+            # breakpoint()
+            pdf_path = page["source_id"]
+            page_text = page["page_text"]
+            page_number = page["page_number"]
+            page_embeddings = [emb.squeeze() for emb in page["embedding"]]
+            # create page_text chunk
+            page_chunk = {
+                "source_id": pdf_path,
+                "page_number": page_number,
+                "content": page_text,
+                "embedding": page_embeddings.pop(0),
+
+            }
+            # create table_chunks
+            table_embeddings = page_embeddings[:len(page["table_structure_detections"])]
+            for table_info, embedding in zip(page["table_structure_detections"], table_embeddings):
+                table_text = table_info['ocr_text']
+                table_chunk = {
+                    "source_id": pdf_path,
+                    "page_number": page_number,
+                    "content": table_text,
+                    "embedding": embedding,
+                }
+                tables.append(table_chunk)
+
+            #create graphic_chunks
+            graphic_embeddings = page_embeddings[len(page["table_structure_detections"]):]
+            for graphic_info, embedding in zip(page["graphic_elements_detections"], graphic_embeddings):
+                graphic_text = graphic_info['ocr_text']
+                graphic_chunk = {
+                    "source_id": pdf_path,
+                    "page_number": page_number,
+                    "content": graphic_text,
+                    "embedding": embedding,
+                }
+                graphics.append(graphic_chunk)
+
+    # got to pull out each unit and create new units for each sub  text item in the page and get the corresponding embedding
+
+    results = text + tables + graphics
+    print(len(results))
+    vdb_op.run(results)
+
+    import pandas as pd
+    df_query = pd.read_csv('/raid/nv-ingest/data/bo767_query_gt.csv').rename(columns={'gt_page':'page'})[['query','pdf','page']]
+    df_query['pdf_page'] = df_query.apply(lambda x: f"{x.pdf}_{x.page}", axis=1) 
+    
+    all_answers = []
+    query_texts = df_query['query'].tolist()
+    top_k = 10
+    result_fields = ["source", "metadata", "text"]
+    query_embeddings = []
+    for query_batch in query_texts:
+        query_tokens = tokenizer(query_batch, return_tensors="pt", padding=True).to('cuda')
+        query_model_results = embedding_model(**query_tokens)
+        query_embeddings += average_pool(query_model_results.last_hidden_state, query_tokens['attention_mask'])
+    for query_embed in query_embeddings:
+        all_answers.append(
+            vdb_op.table.search([query_embed.detach().cpu().numpy()], vector_column_name="vector").select(result_fields).limit(top_k).to_list()
+        )
+    retrieved_pdf_pages = format_retrieved_answers_lance(all_answers)
+    golden_answers = get_correct_answers(df_query)
+    recall_scores = calcuate_recall_list(golden_answers, retrieved_pdf_pages, ks=[1, 3, 5, 10])
+
+    print(f"number of chunks: {len(retrieved_pdf_pages)}")
+    print("Recall scores:")
+    print(recall_scores)
+    print("[bold green]Done![/bold green]")
+
+
+if __name__ == "__main__":
+    from pathlib import Path
+    run_alone(Path("/raid/data/bo767/"))
