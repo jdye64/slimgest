@@ -1,6 +1,7 @@
 from typing import Any, Dict, List, Tuple
 
 import torch
+import os
 from ..model import BaseModel, RunMode
 
 from nemotron_ocr.inference.pipeline import NemotronOCR
@@ -19,7 +20,54 @@ class NemotronOCRV1(BaseModel):
     def __init__(self, model_dir: str) -> None:
         super().__init__()
         self._model = NemotronOCR(model_dir=model_dir)
-        self._ocr_input_shape = (1024, 1024)
+        # NemotronOCR is a high-level pipeline (not an nn.Module). We can optionally
+        # TensorRT-compile individual submodules (e.g. the detector backbone) but
+        # must keep post-processing (NMS, box decoding, etc.) in eager PyTorch/C++.
+        self._enable_trt = os.getenv("SLIMGEST_ENABLE_TORCH_TRT", "").strip().lower() in {"1", "true", "yes", "on"}
+        if self._enable_trt:
+            self._maybe_compile_submodules()
+
+    def _maybe_compile_submodules(self) -> None:
+        """
+        Best-effort TensorRT compilation of internal nn.Modules.
+        Any failure falls back to eager PyTorch without breaking initialization.
+        """
+        try:
+            import torch_tensorrt  # type: ignore
+        except Exception:
+            return
+
+        # Detector is the safest candidate: input is a BCHW image tensor.
+        detector = getattr(self._model, "detector", None)
+        if not isinstance(detector, torch.nn.Module):
+            return
+
+        # NemotronOCR internally resizes/pads to 1024 and runs B=1 (see upstream FIXME);
+        # keep the TRT input shape fixed to avoid accidental batching issues.
+        try:
+            trt_input = torch_tensorrt.Input((1, 3, 1024, 1024), dtype=torch.float16)
+        except TypeError:
+            # Older/newer API variants: fall back to named arg.
+            trt_input = torch_tensorrt.Input(shape=(1, 3, 1024, 1024), dtype=torch.float16)
+
+        # If any torchvision NMS makes it into a compiled graph elsewhere, forcing
+        # that op to run in Torch avoids hard failures.
+        compile_kwargs: Dict[str, Any] = {
+            "inputs": [trt_input],
+            "enabled_precisions": {torch.float16},
+        }
+        if hasattr(torch_tensorrt, "compile"):
+            for k in ("torch_executed_ops", "torch_executed_modules"):
+                if k == "torch_executed_ops":
+                    compile_kwargs[k] = {"torchvision::nms"}
+                elif k == "torch_executed_modules":
+                    compile_kwargs[k] = set()
+            try:
+                self._model.detector = torch_tensorrt.compile(detector, **compile_kwargs)
+            except Exception:
+                # Leave detector as-is on any failure.
+                return
+
 
     def preprocess(self, tensor: torch.Tensor) -> torch.Tensor:
         """Preprocess the input tensor."""
@@ -27,7 +75,14 @@ class NemotronOCRV1(BaseModel):
         return tensor
     
     def invoke(self, input_data: torch.Tensor) -> List[Dict[str, torch.Tensor]]:
-        # Conditionally check and make sure the input data is on the correct device and shape
+        # NemotronOCR expects a single image tensor (CHW). If a batch (BCHW) is
+        # provided, run per-image to keep behavior correct.
+        if isinstance(input_data, torch.Tensor) and input_data.ndim == 4:
+            out: List[Dict[str, torch.Tensor]] = []
+            for i in range(int(input_data.shape[0])):
+                out.extend(self._model(input_data[i]))
+            return out
+
         results = self._model(input_data)
         return results
 

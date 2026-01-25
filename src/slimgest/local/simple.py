@@ -264,10 +264,10 @@ def process_pdf_pages(
     embedding_model,
     device="cuda",
     dpi=150.0,
-    ocr_batch_size: int = 16,
-    table_structure_batch_size: int = 8,
-    graphic_elements_batch_size: int = 8,
-    embedding_batch_size: int = 8,
+    ocr_batch_size: int = 32,
+    table_structure_batch_size: int = 16,
+    graphic_elements_batch_size: int = 16,
+    embedding_batch_size: int = 16,
 ):
     """
     Generator that processes PDF pages one at a time, yielding results for each page.
@@ -650,7 +650,7 @@ def run(
     page_elements = NemotronPageElementsV3()
     table_structure = NemotronTableStructureV1()
     graphic_elements = NemotronGraphicElementsV1()
-    ocr = NemotronOCRV1(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints")
+    ocr = NemotronOCRV1(model_dir="/raid/jdyer/slimgest/models/nemotron-ocr-v1/checkpoints")
     hf_cache_dir = str(Path.home() / ".cache" / "huggingface")
     tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer(cache_dir=hf_cache_dir, force_download=False)
     embedding_model = llama_nemotron_embed_1b_v2.load_model(
