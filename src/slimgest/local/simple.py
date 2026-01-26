@@ -13,8 +13,7 @@ from slimgest.model.local.nemotron_page_elements_v3 import NemotronPageElementsV
 from slimgest.model.local.nemotron_table_structure_v1 import NemotronTableStructureV1
 from slimgest.model.local.nemotron_graphic_elements_v1 import NemotronGraphicElementsV1
 from slimgest.model.local.nemotron_ocr_v1 import NemotronOCRV1
-
-import llama_nemotron_embed_1b_v2
+from slimgest.model.local.llama_nemotron_embed_1b_v2_embedder import LlamaNemotronEmbed1BV2Embedder
 
 import typer
 
@@ -260,14 +259,13 @@ def process_pdf_pages(
     table_structure,
     graphic_elements,
     ocr,
-    tokenizer,
-    embedding_model,
+    embedder,
     device="cuda",
     dpi=150.0,
-    ocr_batch_size: int = 16,
-    table_structure_batch_size: int = 8,
-    graphic_elements_batch_size: int = 8,
-    embedding_batch_size: int = 8,
+    ocr_batch_size: int = 32,
+    table_structure_batch_size: int = 16,
+    graphic_elements_batch_size: int = 16,
+    embedding_batch_size: int = 16,
 ):
     """
     Generator that processes PDF pages one at a time, yielding results for each page.
@@ -473,11 +471,8 @@ def process_pdf_pages(
                 page_metrics["counts"]["embedding_segments"] += len(text_segments)
                 embedding_results: List[Any] = []
                 for seg_batch in _chunked(text_segments, embedding_batch_size):
-                    batch_documents = tokenizer(
-                        seg_batch, padding=True, truncation=True, return_tensors="pt"
-                    ).to("cuda")
                     t0 = time.perf_counter()
-                    out = embedding_model(**batch_documents)
+                    out = embedder.embed(seg_batch, batch_size=embedding_batch_size)
                     dt = time.perf_counter() - t0
                     page_metrics["timings"]["embedding"] += dt
                     _metrics_model_add(page_metrics, "embedding", dt, items=len(seg_batch), calls=1)
@@ -506,8 +501,7 @@ def run_pipeline(
     table_structure: NemotronTableStructureV1,
     graphic_elements: NemotronGraphicElementsV1,
     ocr: NemotronOCRV1,
-    tokenizer,
-    embedding_model,
+    embedder,
     raw_output_dir: Optional[Path] = None,
     dpi: float = 150.0,
     expected_total_pages: int = 54730,
@@ -534,8 +528,7 @@ def run_pipeline(
             table_structure,
             graphic_elements,
             ocr,
-            tokenizer,
-            embedding_model,
+            embedder,
             device="cuda",
             dpi=dpi,
         ):
@@ -645,17 +638,41 @@ def run_pipeline(
 def run(
     input_dir: Path = typer.Argument(..., exists=True, file_okay=True),
     raw_output_dir: Optional[Path] = typer.Option(None, help="Directory to save raw OCR results (optional)."),
+    page_elements_endpoint: Optional[str] = typer.Option(
+        None,
+        help="Optional page elements NIM endpoint URL. If set, page elements runs remotely and local weights are not loaded.",
+    ),
+    table_structure_endpoint: Optional[str] = typer.Option(
+        None,
+        help="Optional table structure NIM endpoint URL. If set, table structure runs remotely and local weights are not loaded.",
+    ),
+    graphic_elements_endpoint: Optional[str] = typer.Option(
+        None,
+        help="Optional graphic elements NIM endpoint URL. If set, graphic elements runs remotely and local weights are not loaded.",
+    ),
+    ocr_endpoint: Optional[str] = typer.Option(
+        None,
+        help="Optional OCR NIM endpoint URL (e.g. 'http://localhost:8009/v1/cv/nvidia/nemoretriever-ocr-v1'). If set, OCR runs remotely and the local OCR model is not loaded.",
+    ),
+    embedding_endpoint: Optional[str] = typer.Option(
+        None,
+        help="Optional embedding endpoint URL (often OpenAI-compatible '/v1/embeddings'). If set, embeddings run remotely and the local embedding model is not loaded.",
+    ),
+    embedding_model_name: Optional[str] = typer.Option(
+        None,
+        help="Optional embedding model name for remote endpoint (sent as 'model' in payload).",
+    ),
 ):
     # Load Models
-    page_elements = NemotronPageElementsV3()
-    table_structure = NemotronTableStructureV1()
-    graphic_elements = NemotronGraphicElementsV1()
-    ocr = NemotronOCRV1(model_dir="/home/jdyer/Development/slim-gest/models/nemotron-ocr-v1/checkpoints")
-    hf_cache_dir = str(Path.home() / ".cache" / "huggingface")
-    tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer(cache_dir=hf_cache_dir, force_download=False)
-    embedding_model = llama_nemotron_embed_1b_v2.load_model(
-        device="cuda", trust_remote_code=True, cache_dir=hf_cache_dir, force_download=False
+    page_elements = NemotronPageElementsV3(endpoint=page_elements_endpoint, remote_batch_size=32)
+    table_structure = NemotronTableStructureV1(endpoint=table_structure_endpoint, remote_batch_size=32)
+    graphic_elements = NemotronGraphicElementsV1(endpoint=graphic_elements_endpoint, remote_batch_size=32)
+    ocr = NemotronOCRV1(
+        model_dir="/raid/jdyer/slimgest/models/nemotron-ocr-v1/checkpoints",
+        endpoint=ocr_endpoint,
+        remote_batch_size=32,
     )
+    embedder = LlamaNemotronEmbed1BV2Embedder(endpoint=embedding_endpoint, model_name=embedding_model_name, normalize=True)
 
 
     
@@ -675,7 +692,6 @@ def run(
         table_structure,
         graphic_elements,
         ocr,
-        tokenizer,
-        embedding_model,
+        embedder,
         raw_output_dir=raw_output_dir,
     )
