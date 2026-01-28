@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from rich.console import Console
 from rich.traceback import install
@@ -13,28 +13,14 @@ from tqdm import tqdm
 
 from slimgest.model.local.nemotron_ocr_v1 import NemotronOCRV1
 
-from ._io import crop_tensor_normalized_xyxy, iter_images, load_image_rgb_chw_u8, read_json, write_json
+from ._io import crop_tensor_normalized_xyxy, load_image_rgb_chw_u8, read_json, write_json
 
 
 install(show_locals=False)
 console = Console()
-app = typer.Typer(
-    help="Stage 5: run nemotron_ocr_v1 over detections from stages 3/4 and save JSON alongside each image."
-)
+app = typer.Typer(help="Stage 5: run nemotron_ocr_v1 over stage2 table/chart/infographic detections; save JSON per image.")
 
 DEFAULT_INPUT_DIR = Path("./data/pages")
-
-
-def _stage3_json_for_image(img_path: Path) -> Path:
-    return img_path.with_name(img_path.name + ".graphic_elements_v1.json")
-
-
-def _stage4_json_for_image(img_path: Path) -> Path:
-    return img_path.with_name(img_path.name + ".table_structure_v1.json")
-
-
-def _out_path_for_image(img_path: Path) -> Path:
-    return img_path.with_name(img_path.name + ".nemotron_ocr_v1.json")
 
 
 def _resize_pad_tensor(img: torch.Tensor, target_hw: Tuple[int, int] = (1024, 1024), pad_value: float = 114.0) -> torch.Tensor:
@@ -61,38 +47,160 @@ def _resize_pad_tensor(img: torch.Tensor, target_hw: Tuple[int, int] = (1024, 10
     return x.to(dtype=torch.uint8)
 
 
-def _collect_page_level_detections(s3: Any, s4: Any) -> List[Dict[str, Any]]:
-    """
-    Returns a flat list of items each with:
-      - source: "graphic_elements_v1" | "table_structure_v1"
-      - bbox_xyxy_norm_in_page: [x1,y1,x2,y2]
-      - meta: other fields
-    """
-    out: List[Dict[str, Any]] = []
-    for source, blob in (("graphic_elements_v1", s3), ("table_structure_v1", s4)):
-        if not blob:
-            continue
-        for region in (blob.get("regions") or []):
-            page_el = region.get("page_element") or {}
-            for det in (region.get("detections") or []):
-                bbox_page = det.get("bbox_xyxy_norm_in_page")
-                if not bbox_page or len(bbox_page) != 4:
-                    continue
-                out.append(
-                    {
-                        "source_model": source,
-                        "page_element": page_el,
-                        "detection": det,
-                        "bbox_xyxy_norm_in_page": bbox_page,
-                    }
-                )
+STAGE2_SUFFIX = ".page_elements_v3.json"
+OUT_SUFFIX = ".nemotron_ocr_v1.json"
+
+
+class _Stopwatch:
+    def __init__(self) -> None:
+        self._t0 = time.perf_counter()
+
+    def elapsed_s(self) -> float:
+        return float(time.perf_counter() - self._t0)
+
+
+class _TimerBank:
+    def __init__(self) -> None:
+        self._acc: Dict[str, float] = {}
+
+    def add(self, key: str, dt_s: float) -> None:
+        self._acc[key] = float(self._acc.get(key, 0.0) + float(dt_s))
+
+    def timed(self, key: str):
+        bank = self
+
+        class _Ctx:
+            def __enter__(self_inner):
+                self_inner._t0 = time.perf_counter()
+                return None
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                bank.add(key, time.perf_counter() - self_inner._t0)
+                return False
+
+        return _Ctx()
+
+    def as_dict(self) -> Dict[str, float]:
+        return dict(sorted(self._acc.items(), key=lambda kv: kv[0]))
+
+
+def _resolve_image_path(input_dir: Path, json_path: Path, blob: Any, suffix: str) -> Path:
+    # 1) Prefer the embedded path if it exists.
+    if isinstance(blob, dict):
+        img = blob.get("image")
+        if isinstance(img, dict):
+            p = img.get("path")
+            if isinstance(p, str) and p.strip():
+                cand = Path(p)
+                if cand.exists():
+                    return cand
+
+    # 2) Infer from filename convention: <image_name> + suffix
+    name = json_path.name
+    if name.endswith(suffix):
+        img_name = name[: -len(suffix)]
+        cand = input_dir / img_name
+        return cand
+
+    # 3) Last resort: put it next to the JSON and strip suffix.
+    return json_path.with_name(name[: -len(suffix)])
+
+
+def _iter_stage_jsons(input_dir: Path, suffix: str) -> List[Path]:
+    out: List[Path] = []
+    for p in sorted(input_dir.iterdir()):
+        if p.is_file() and p.name.endswith(suffix):
+            out.append(p)
     return out
+
+
+_STAGE2_LABELS_INCLUDE = {0, 1, 3}  # table, chart, infographic
+_STAGE2_LABEL_NAMES_INCLUDE = {"table", "chart", "infographic"}
+
+
+def _is_stage2_target_detection(det: Dict[str, Any]) -> bool:
+    try:
+        lab = det.get("label", None)
+        if lab is not None:
+            # tolerate float labels and string numerals
+            if int(lab) in _STAGE2_LABELS_INCLUDE:
+                return True
+    except Exception:
+        pass
+
+    nm = det.get("label_name", None)
+    if isinstance(nm, str) and nm.strip().lower() in _STAGE2_LABEL_NAMES_INCLUDE:
+        return True
+    return False
+
+
+def _iter_target_detections_from_stage2_json(blob: Any) -> Iterable[Tuple[Dict[str, Any], List[float]]]:
+    """
+    Yields (detection_dict, bbox_xyxy_norm_in_page).
+    Expects stage2 schema:
+      - detections[].bbox_xyxy_norm
+      - detections[].label
+      - detections[].label_name
+    """
+    if not isinstance(blob, dict):
+        return []
+    dets = blob.get("detections") or []
+    if not isinstance(dets, list):
+        return []
+    for det in dets:
+        if not isinstance(det, dict):
+            continue
+        if not _is_stage2_target_detection(det):
+            continue
+        bbox = det.get("bbox_xyxy_norm")
+        if not (isinstance(bbox, (list, tuple)) and len(bbox) == 4):
+            continue
+        try:
+            bb = [float(x) for x in bbox]
+        except Exception:
+            continue
+        yield (det, bb)
+
+
+def _extract_text_best_effort(raw: Any) -> str:
+    """
+    Nemotron OCR wrapper shapes vary:
+      - remote: {"text": "...", "raw": ...} per image
+      - local: often list[dict] with line-level fields
+    """
+    if raw is None:
+        return ""
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, dict):
+        for k in ("text", "output_text", "generated_text", "ocr_text"):
+            v = raw.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # remote wrapper uses {"text": ..., "raw": ...}
+        if "raw" in raw:
+            return _extract_text_best_effort(raw.get("raw"))
+        return str(raw).strip()
+    if isinstance(raw, list):
+        parts: List[str] = []
+        for item in raw:
+            t = _extract_text_best_effort(item)
+            if t:
+                parts.append(t)
+        return " ".join(parts).strip()
+    return str(raw).strip()
+
+
+def _out_path(output_dir: Path, img_path: Path) -> Path:
+    return output_dir / (img_path.name + OUT_SUFFIX)
 
 
 @app.command()
 def run(
     input_dir: Path = typer.Option(DEFAULT_INPUT_DIR, "--input-dir", exists=True, file_okay=False),
-    device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", help="Device for image tensors."),
+    output_dir: Optional[Path] = typer.Option(None, "--output-dir", file_okay=False, help="Directory to write stage5 JSON outputs."),
+    device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", help="Device for tensors/model (single-device only)."),
+    batch_size: int = typer.Option(16, "--batch-size", min=1, help="Target number of crops per OCR batch."),
     ocr_model_dir: Path = typer.Option(
         Path("/raid/jdyer/slimgest/models/nemotron-ocr-v1/checkpoints"),
         "--ocr-model-dir",
@@ -100,91 +208,282 @@ def run(
     ),
     ocr_endpoint: Optional[str] = typer.Option(
         None,
+        "--ocr-endpoint",
         help="Optional OCR NIM endpoint URL. If set, OCR runs remotely and local weights are not loaded.",
     ),
-    remote_batch_size: int = typer.Option(32, help="Remote OCR batch size when using --ocr-endpoint."),
+    remote_batch_size: int = typer.Option(32, "--remote-batch-size", help="Remote OCR internal chunk size when using --ocr-endpoint."),
+    resize_to_1024: bool = typer.Option(True, "--resize-to-1024/--no-resize-to-1024", help="Resize+pad crops to 1024x1024 before OCR."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing JSON outputs."),
-    limit: Optional[int] = typer.Option(None, help="Optionally limit number of images processed."),
+    limit: Optional[int] = typer.Option(None, "--limit", help="Optionally limit number of images processed."),
 ):
     dev = torch.device(device)
-    ocr = NemotronOCRV1(
-        model_dir=str(ocr_model_dir),
-        endpoint=ocr_endpoint,
-        remote_batch_size=int(remote_batch_size),
-    )
+    out_dir = Path(output_dir) if output_dir is not None else input_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    images = iter_images(input_dir)
+    timers = _TimerBank()
+    sw_total = _Stopwatch()
+
+    with timers.timed("01_discover_jsons"):
+        stage2_jsons = _iter_stage_jsons(input_dir, STAGE2_SUFFIX)
+
+    # Build per-image task lists from stage2 JSON sidecars.
+    tasks_by_image: Dict[Path, List[Dict[str, Any]]] = {}
+    prereq_by_image: Dict[Path, Dict[str, Optional[Path]]] = {}
+    bad_json = 0
+    missing_image = 0
+    n_stage2_target_dets = 0
+
+    def _add_tasks_from_stage2_json(json_path: Path) -> None:
+        nonlocal bad_json, missing_image, n_stage2_target_dets
+        with timers.timed("02_read_json"):
+            try:
+                blob = read_json(json_path)
+            except Exception:
+                bad_json += 1
+                return
+        img_path = _resolve_image_path(input_dir, json_path, blob, STAGE2_SUFFIX)
+        if not img_path.exists():
+            missing_image += 1
+            return
+
+        for det, bbox in _iter_target_detections_from_stage2_json(blob):
+            # Keep a stable page-element-like record (stage2 outputs are already page-level)
+            page_el = {
+                "bbox_xyxy_norm": det.get("bbox_xyxy_norm"),
+                "label": det.get("label"),
+                "label_name": det.get("label_name"),
+                "score": det.get("score"),
+            }
+            rec = {
+                "source_model": "page_elements_v3",
+                "bbox_xyxy_norm_in_page": bbox,
+                "page_element": page_el,
+                "detection": det,
+                "source_json": str(json_path),
+            }
+            tasks_by_image.setdefault(img_path, []).append(rec)
+            prereq_by_image.setdefault(img_path, {"stage2_json": None})
+            prereq_by_image[img_path]["stage2_json"] = json_path
+            n_stage2_target_dets += 1
+
+    with timers.timed("03_parse_stage2"):
+        for p in stage2_jsons:
+            _add_tasks_from_stage2_json(p)
+
+    images = sorted(tasks_by_image.keys())
     if limit is not None:
         images = images[: int(limit)]
 
-    console.print(f"[bold cyan]Stage5[/bold cyan] images={len(images)} input_dir={input_dir} device={dev}")
+    total_crops = int(sum(len(tasks_by_image[p]) for p in images))
+    total_batches = int((total_crops + int(batch_size) - 1) // int(batch_size)) if total_crops > 0 else 0
 
-    processed = 0
-    skipped = 0
-    missing_prereq = 0
-    bad_prereq = 0
-    for img_path in tqdm(images, desc="Stage5 images", unit="img"):
-        out_path = _out_path_for_image(img_path)
-        if out_path.exists() and not overwrite:
-            skipped += 1
-            continue
+    console.print(
+        f"[bold cyan]Stage5[/bold cyan] input_dir={input_dir} output_dir={out_dir} device={dev} "
+        f"images_with_detections={len(images)} total_detections={total_crops} "
+        f"total_batches(ceil(dets/batch_size))={total_batches} batch_size={int(batch_size)} "
+        f"stage2_jsons={len(stage2_jsons)} stage2_target_dets={n_stage2_target_dets} bad_json={bad_json} missing_image={missing_image} "
+        f"ocr={'remote' if ocr_endpoint else 'local'} resize_to_1024={resize_to_1024}"
+    )
 
-        s3_path = _stage3_json_for_image(img_path)
-        s4_path = _stage4_json_for_image(img_path)
-        if not s3_path.exists() or not s4_path.exists():
-            missing_prereq += 1
-            continue
-
-        try:
-            s3 = read_json(s3_path)
-            s4 = read_json(s4_path)
-        except Exception:
-            bad_prereq += 1
-            continue
-        items = _collect_page_level_detections(s3, s4)
-
-        page_tensor, (h, w) = load_image_rgb_chw_u8(img_path, dev)
-
-        t0 = time.perf_counter()
-        results: List[Dict[str, Any]] = []
-        with torch.inference_mode():
-            for it in items:
-                bbox = it["bbox_xyxy_norm_in_page"]
-                crop = crop_tensor_normalized_xyxy(page_tensor, bbox)
-                crop_in = _resize_pad_tensor(crop, target_hw=(1024, 1024))
-                out = ocr.invoke(crop_in)
-                results.append(
-                    {
-                        "source_model": it["source_model"],
-                        "bbox_xyxy_norm_in_page": bbox,
-                        "page_element": it.get("page_element"),
-                        "detection": it.get("detection"),
-                        "ocr_raw": out,
-                        # Best-effort text flattening (works for both local and remote shapes)
-                        "ocr_text": (
-                            " ".join([str(p.get("text", "")) for p in out]).strip()
-                            if isinstance(out, list)
-                            else str(out)
-                        ),
-                    }
-                )
-        dt = time.perf_counter() - t0
-
-        payload: Dict[str, Any] = {
+    if total_crops == 0:
+        report = {
             "schema_version": 1,
             "stage": 5,
             "model": "nemotron_ocr_v1",
-            "image": {"path": str(img_path), "height": int(h), "width": int(w)},
-            "stage3_json": str(s3_path),
-            "stage4_json": str(s4_path),
-            "regions": results,
-            "timing": {"seconds": float(dt)},
+            "input_dir": str(input_dir),
+            "output_dir": str(out_dir),
+            "device": str(dev),
+            "batch_size": int(batch_size),
+            "resize_to_1024": bool(resize_to_1024),
+            "counts": {
+                "images_with_detections": 0,
+                "total_detections": 0,
+                "total_batches": 0,
+                "bad_json": int(bad_json),
+                "missing_image": int(missing_image),
+            },
+            "timing_s": timers.as_dict(),
+            "wall_s": sw_total.elapsed_s(),
         }
-        write_json(out_path, payload)
-        processed += 1
+        write_json(out_dir / "stage5_nemotron_ocr_v1.report.json", report)
+        console.print("[yellow]No table/chart/infographic detections found in stage2 JSONs; wrote report and exiting.[/yellow]")
+        return
+
+    with timers.timed("05_init_model"):
+        ocr = NemotronOCRV1(
+            model_dir=str(ocr_model_dir),
+            endpoint=str(ocr_endpoint).strip() if ocr_endpoint else None,
+            remote_batch_size=int(remote_batch_size),
+        )
+
+    processed_images = 0
+    skipped_images = 0
+    processed_crops = 0
+    processed_batches = 0
+    failed_images = 0
+
+    p_imgs = tqdm(total=len(images), desc="Stage5 images", unit="img")
+    p_batches = tqdm(total=total_batches, desc="Stage5 OCR batches", unit="batch")
+
+    sw_ocr = _Stopwatch()
+
+    for img_i, img_path in enumerate(images, start=1):
+        out_path = _out_path(out_dir, img_path)
+        if out_path.exists() and not overwrite:
+            skipped_images += 1
+            p_imgs.update(1)
+            p_imgs.set_postfix(img=f"{img_i}/{len(images)}", skipped=skipped_images)
+            continue
+
+        tasks = tasks_by_image.get(img_path, [])
+        if not tasks:
+            p_imgs.update(1)
+            continue
+
+        p_imgs.set_postfix(img=f"{img_i}/{len(images)}", file=img_path.name, dets=len(tasks))
+
+        try:
+            with timers.timed("06_load_image"):
+                page_tensor, (h, w) = load_image_rgb_chw_u8(img_path, dev)
+
+            # Build crop tensors in task order.
+            crops: List[torch.Tensor] = []
+            with torch.inference_mode():
+                for rec in tasks:
+                    bbox = rec["bbox_xyxy_norm_in_page"]
+                    with timers.timed("07_crop"):
+                        crop = crop_tensor_normalized_xyxy(page_tensor, bbox)
+                    if resize_to_1024:
+                        with timers.timed("08_resize_pad"):
+                            crop = _resize_pad_tensor(crop, target_hw=(1024, 1024))
+                    crops.append(crop)
+
+                # OCR batches
+                ocr_raw_outs: List[Any] = []
+                for j in range(0, len(crops), int(batch_size)):
+                    batch = crops[j : j + int(batch_size)]
+                    if not batch:
+                        continue
+                    t_batch0 = time.perf_counter()
+                    with timers.timed("09_model_invoke"):
+                        if ocr_endpoint:
+                            b = torch.stack([t if t.ndim == 3 else t.squeeze(0) for t in batch], dim=0)
+                            ocr_raw_outs.extend(list(ocr.invoke(b)))
+                        else:
+                            # Local pipeline is effectively per-image; keep "batch" boundaries
+                            # for reporting/throughput visibility.
+                            for t in batch:
+                                ocr_raw_outs.append(ocr.invoke(t))
+                    batch_dt = max(1e-9, time.perf_counter() - t_batch0)
+
+                    processed_batches += 1
+                    processed_crops += int(len(batch))
+                    p_batches.update(1)
+
+                    # Performance visibility (focus: pages/sec and batch cadence)
+                    elapsed = max(1e-9, sw_ocr.elapsed_s())
+                    pages_per_s = processed_crops / elapsed
+                    batch_pages_per_s = len(batch) / batch_dt
+                    p_batches.set_postfix(
+                        pages_s=f"{pages_per_s:.2f}",
+                        batch_pages_s=f"{batch_pages_per_s:.2f}",
+                        crops=f"{processed_crops}/{total_crops}",
+                        bs=len(batch),
+                    )
+
+            if len(ocr_raw_outs) != len(tasks):
+                raise RuntimeError(f"OCR output count mismatch: got {len(ocr_raw_outs)} outputs for {len(tasks)} crops.")
+
+            with timers.timed("10_postprocess"):
+                regions_out: List[Dict[str, Any]] = []
+                for rec, raw in zip(tasks, ocr_raw_outs):
+                    regions_out.append(
+                        {
+                            "source_model": rec.get("source_model"),
+                            "bbox_xyxy_norm_in_page": rec.get("bbox_xyxy_norm_in_page"),
+                            "page_element": rec.get("page_element"),
+                            "detection": rec.get("detection"),
+                            "source_json": rec.get("source_json"),
+                            "ocr_raw": raw,
+                            "ocr_text": _extract_text_best_effort(raw),
+                        }
+                    )
+
+            payload: Dict[str, Any] = {
+                "schema_version": 1,
+                "stage": 5,
+                "model": "nemotron_ocr_v1",
+                "image": {"path": str(img_path), "height": int(h), "width": int(w)},
+                "stage2_json": str((prereq_by_image.get(img_path) or {}).get("stage2_json") or ""),
+                "regions": regions_out,
+                "run": {
+                    "device": str(dev),
+                    "batch_size": int(batch_size),
+                    "resize_to_1024": bool(resize_to_1024),
+                    "ocr_endpoint": str(ocr_endpoint) if ocr_endpoint else None,
+                    "remote_batch_size": int(remote_batch_size),
+                },
+            }
+            with timers.timed("11_write_json"):
+                write_json(out_path, payload)
+
+            processed_images += 1
+        except Exception as e:
+            failed_images += 1
+            console.print(f"[red]Stage5 failed[/red] file={img_path.name} err={type(e).__name__}: {e}")
+        finally:
+            p_imgs.update(1)
+
+    p_imgs.close()
+    p_batches.close()
+
+    wall_s = sw_total.elapsed_s()
+    pages_s = (processed_crops / max(1e-9, sw_ocr.elapsed_s())) if processed_crops else 0.0
+
+    report = {
+        "schema_version": 1,
+        "stage": 5,
+        "model": "nemotron_ocr_v1",
+        "input_dir": str(input_dir),
+        "output_dir": str(out_dir),
+        "device": str(dev),
+        "batch_size": int(batch_size),
+        "resize_to_1024": bool(resize_to_1024),
+        "ocr": {
+            "mode": "remote" if ocr_endpoint else "local",
+            "endpoint": str(ocr_endpoint) if ocr_endpoint else None,
+            "model_dir": str(ocr_model_dir),
+            "remote_batch_size": int(remote_batch_size),
+        },
+        "counts": {
+            "stage2_jsons": int(len(stage2_jsons)),
+            "stage2_target_detections": int(n_stage2_target_dets),
+            "images_with_detections": int(len(images)),
+            "processed_images": int(processed_images),
+            "skipped_images": int(skipped_images),
+            "failed_images": int(failed_images),
+            "total_detections": int(total_crops),
+            "processed_crops": int(processed_crops),
+            "total_batches": int(total_batches),
+            "processed_batches": int(processed_batches),
+            "bad_json": int(bad_json),
+            "missing_image": int(missing_image),
+        },
+        "throughput": {
+            "pages_per_second": float(pages_s),
+        },
+        "timing_s": timers.as_dict(),
+        "wall_s": float(wall_s),
+    }
+
+    with timers.timed("12_write_report"):
+        report_path = out_dir / "stage5_nemotron_ocr_v1.report.json"
+        write_json(report_path, report)
 
     console.print(
-        f"[green]Done[/green] processed={processed} skipped={skipped} missing_prereq={missing_prereq} bad_prereq={bad_prereq} wrote_json_suffix=.nemotron_ocr_v1.json"
+        f"[green]Done[/green] processed_images={processed_images} skipped_images={skipped_images} failed_images={failed_images} "
+        f"processed_crops={processed_crops}/{total_crops} processed_batches={processed_batches}/{total_batches} "
+        f"pages_per_second={pages_s:.2f} report={report_path}"
     )
 
 

@@ -12,6 +12,14 @@ from PIL import Image
 
 IMAGE_EXTS = (".png", ".jpg", ".jpeg")
 
+PAGE_ELEMENT_LABELS = {
+    0: "table",
+    1: "chart",
+    2: "title",
+    3: "infographic",
+    4: "text",
+    5: "header_footer",
+}
 
 def iter_images(input_dir: Path) -> List[Path]:
     paths: List[Path] = []

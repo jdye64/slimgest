@@ -47,6 +47,7 @@ def run(
     ),
     batch_size: int = typer.Option(64, "--batch-size", min=1, help="Embedding batch size (texts per request)."),
 ):
+    dev = torch.device(device)
     # Use the shared embedder wrapper; if endpoint is set, it runs remotely.
     embedder = LlamaNemotronEmbed1BV2Embedder(endpoint=embedding_endpoint, model_name=embedding_model_name, normalize=True)
 

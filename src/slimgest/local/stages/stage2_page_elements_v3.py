@@ -12,7 +12,7 @@ from tqdm import tqdm
 
 from slimgest.model.local.nemotron_page_elements_v3 import NemotronPageElementsV3
 
-from ._io import iter_images, load_image_rgb_chw_u8, to_bbox_list, to_scalar_float, to_scalar_int, write_json
+from ._io import PAGE_ELEMENT_LABELS, iter_images, load_image_rgb_chw_u8, to_bbox_list, to_scalar_float, to_scalar_int, write_json
 
 
 install(show_locals=False)
@@ -101,7 +101,11 @@ def run(
             continue
         to_process.append(img_path)
 
-    for batch_paths in tqdm(list(_chunked(to_process, batch_size)), desc="Stage2 images", unit="batch"):
+    batches = list(_chunked(to_process, batch_size))
+    images_done = 0
+    pbar = tqdm(batches, desc="Stage2", unit="batch")
+    pbar.set_postfix(img=f"{images_done}/{len(to_process)}")
+    for batch_paths in pbar:
         # Load + preprocess
         tensors: List[torch.Tensor] = []
         shapes: List[Tuple[int, int]] = []
@@ -130,14 +134,18 @@ def run(
                 boxes, labels, scores = model.postprocess(preds)
                 dets: List[Dict[str, Any]] = []
                 for box, lab, score in zip(boxes, labels, scores):
+                    lab_i = to_scalar_int(lab)
+                    label_name = PAGE_ELEMENT_LABELS.get(int(lab_i), f"unknown_{int(lab_i)}")
                     dets.append(
                         {
                             "bbox_xyxy_norm": to_bbox_list(box),
-                            "label": to_scalar_int(lab),
+                            "label": lab_i,
+                            "label_name": label_name,
                             "score": to_scalar_float(score),
                         }
                     )
 
+                dt = time.perf_counter() - t0
                 payload: Dict[str, Any] = {
                     "schema_version": 1,
                     "stage": 2,
@@ -148,15 +156,14 @@ def run(
                         "width": int(orig_shape[1]),
                     },
                     "detections": dets,
-                    "timing": {"seconds": 0.0},  # filled below
+                    "timing": {"seconds": dt},
                 }
                 out_path = _out_path_for_image(img_path)
                 write_json(out_path, payload)
                 processed += 1
-        dt = time.perf_counter() - t0
 
-        # Optional: update each file's timing without re-reading (best-effort).
-        # We keep this coarse and avoid extra IO by not rewriting the JSON a second time.
+        images_done += len(batch_paths)
+        pbar.set_postfix(img=f"{images_done}/{len(to_process)}", batch_imgs=str(len(batch_paths)))
 
     console.print(
         f"[green]Done[/green] processed={processed} skipped={skipped} wrote_json_suffix=.page_elements_v3.json"

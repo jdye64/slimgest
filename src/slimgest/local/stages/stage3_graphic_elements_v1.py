@@ -42,8 +42,72 @@ def _out_path_for_image(img_path: Path) -> Path:
 
 
 def _is_graphic_label(label: int) -> bool:
-    # In local/simple.py: label 0 is table; labels in [1,2,3] treated as "graphic".
-    return int(label) in (1, 2, 3)
+    # # In local/simple.py: label 0 is table; labels in [1,2,3] treated as "graphic".
+    # return int(label) in (1, 2, 3)
+    # 0 -> table
+    # 1 -> chart
+    # 2 -> text
+    # 3 -> infographic
+    # 4 -> header_footer
+    return int(label) in (1, 3)
+
+
+def _count_graphic_region_detections_from_stage2_json(s2: Any) -> int:
+    """
+    Stage2 outputs include:
+      - detections[].label_name (preferred)
+      - detections[].label (fallback)
+
+    For stage3, we count regions that will be processed here: label_name in {"chart", "infographic"}
+    (case-insensitive). If label_name is missing, we fall back to label in {1, 3}.
+    """
+    if not isinstance(s2, dict):
+        return 0
+    dets = s2.get("detections") or []
+    if not isinstance(dets, list):
+        return 0
+    n = 0
+    for d in dets:
+        if not isinstance(d, dict):
+            continue
+        name = d.get("label_name")
+        if isinstance(name, str):
+            nm = name.strip().lower()
+            if nm in ("chart", "infographic"):
+                n += 1
+                continue
+        # Fallback for older stage2 payloads (or if label_name is absent)
+        if name is None:
+            try:
+                if int(d.get("label", -1)) in (1, 3):
+                    n += 1
+            except Exception:
+                pass
+    return int(n)
+
+
+def _precount_total_graphic_region_detections(images: Sequence[Path]) -> Tuple[int, Dict[Path, int]]:
+    """
+    Pre-scan stage2 sidecars to compute:
+      - total number of chart/infographic detections across images
+      - per-image chart/infographic detection counts (used to update progress without re-reading stage2 on skips)
+    """
+    counts: Dict[Path, int] = {}
+    total = 0
+    for img_path in images:
+        stage2_path = _stage2_json_for_image(img_path)
+        if not stage2_path.exists():
+            counts[img_path] = 0
+            continue
+        try:
+            s2 = read_json(stage2_path)
+        except Exception:
+            counts[img_path] = 0
+            continue
+        n = _count_graphic_region_detections_from_stage2_json(s2)
+        counts[img_path] = int(n)
+        total += int(n)
+    return int(total), counts
 
 
 def _chunked(seq: Sequence[Any], batch_size: int) -> Iterable[List[Any]]:
@@ -110,16 +174,23 @@ def run(
     if limit is not None:
         images = images[: int(limit)]
 
-    console.print(f"[bold cyan]Stage3[/bold cyan] images={len(images)} input_dir={input_dir} device={dev}")
+    total_region_dets, region_dets_by_image = _precount_total_graphic_region_detections(images)
+    console.print(
+        f"[bold cyan]Stage3[/bold cyan] images={len(images)} "
+        f"chart_infographic_detections_total={total_region_dets} input_dir={input_dir} device={dev}"
+    )
 
     processed = 0
     skipped = 0
     missing_stage2 = 0
     bad_stage2 = 0
-    for img_path in tqdm(images, desc="Stage3 images", unit="img"):
+    pbar = tqdm(total=total_region_dets, desc="Stage3 progress", unit="det")
+    for img_i, img_path in enumerate(images, start=1):
+        pbar.set_postfix(img=f"{img_i}/{len(images)}", file=img_path.name)
         out_path = _out_path_for_image(img_path)
         if out_path.exists() and not overwrite:
             skipped += 1
+            pbar.update(int(region_dets_by_image.get(img_path, 0)))
             continue
 
         stage2_path = _stage2_json_for_image(img_path)
@@ -229,7 +300,9 @@ def run(
         }
         write_json(out_path, payload)
         processed += 1
+        pbar.update(int(region_dets_by_image.get(img_path, 0)))
 
+    pbar.close()
     console.print(
         f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage2={missing_stage2} bad_stage2={bad_stage2} wrote_json_suffix=.graphic_elements_v1.json"
     )
