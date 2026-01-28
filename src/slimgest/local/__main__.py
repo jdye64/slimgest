@@ -4,6 +4,7 @@ import typer
 
 from . import analyze_metrics
 from . import simple
+from . import multi_gpu
 from .stages import (
     stage2_page_elements_v3,
     stage3_graphic_elements_v1,
@@ -17,6 +18,7 @@ from .stages import (
 
 app = typer.Typer(help="Simplest pipeline with limited CPU parallelism while using maximum GPU possible")
 app.add_typer(simple.app, name="simple")
+app.add_typer(multi_gpu.app, name="multi-gpu")
 app.add_typer(analyze_metrics.app, name="analyze")
 app.add_typer(stage2_page_elements_v3.app, name="stage2")
 app.add_typer(stage3_graphic_elements_v1.app, name="stage3")
