@@ -63,12 +63,6 @@ jobs:
           BRANCH="${GITHUB_REF_NAME:-unknown}"
           REF="${GITHUB_REF:-unknown}"
 
-          # Sanitize for PEP 440 local version label (only [A-Za-z0-9._-]).
-          SAN_BRANCH="$(echo "$BRANCH" | tr '/@' '..' | tr -cd 'A-Za-z0-9._-' | tr '[:upper:]' '[:lower:]')"
-          if [[ -z "$SAN_BRANCH" ]]; then
-            SAN_BRANCH="unknown"
-          fi
-
           BASE_VERSION="$(python - <<'PY'
           import tomllib
           from pathlib import Path
@@ -80,10 +74,14 @@ jobs:
           EVENT="${GITHUB_EVENT_NAME}"
           PUBLISH_TO_INPUT="${{ inputs.publish_to }}"
           VERSION_INPUT="${{ inputs.version }}"
+          RUN_NO="${GITHUB_RUN_NUMBER:-0}"
 
           if [[ "$EVENT" == "schedule" || "$EVENT" == "push" ]]; then
             PUBLISH_TO="testpypi"
-            BUILD_VERSION="${BASE_VERSION}.dev${DATE_UTC}+${SAN_BRANCH}.${SHA_SHORT}"
+            # NOTE: TestPyPI/PyPI reject PEP 440 local version segments (the "+...").
+            # Use a PEP 440-compliant dev version that stays unique per workflow run
+            # and includes the UTC date.
+            BUILD_VERSION="${BASE_VERSION}.dev${DATE_UTC}${RUN_NO}"
           else
             PUBLISH_TO="$PUBLISH_TO_INPUT"
             if [[ "$PUBLISH_TO" == "pypi" ]]; then
@@ -93,11 +91,11 @@ jobs:
               fi
               BUILD_VERSION="${VERSION_INPUT}"
             else
-              # Manual TestPyPI run: allow explicit version, otherwise use nightly-style version.
+              # Manual TestPyPI run: allow explicit version, otherwise use CI-style dev version.
               if [[ -n "${VERSION_INPUT}" ]]; then
                 BUILD_VERSION="${VERSION_INPUT}"
               else
-                BUILD_VERSION="${BASE_VERSION}.dev${DATE_UTC}+${SAN_BRANCH}.${SHA_SHORT}"
+                BUILD_VERSION="${BASE_VERSION}.dev${DATE_UTC}${RUN_NO}"
               fi
             fi
           fi

@@ -178,7 +178,8 @@ CI wheel publishing
 - A GitHub Actions workflow publishes a wheel to **TestPyPI**:
   - **On every commit to `main`**
   - **Nightly** on a schedule
-- Nightly TestPyPI builds use a version like `0.1.0.devYYYYMMDD+branch.sha` so the wheel filename includes the **UTC date**, **branch**, and **git short SHA**.
+- TestPyPI builds use a PEP 440 dev version like `0.1.0.devYYYYMMDD<run>` so the wheel filename includes the **UTC date** and stays **unique per CI run**.
+- The **git short SHA** and **branch/ref** are embedded in the wheel itself (see `slimgest.build_info.get_build_info()`).
 - Manual runs can publish to **PyPI** (requires specifying `version`).
 - Required GitHub secrets:
   - `TEST_PYPI_API_TOKEN` (used for nightly/TestPyPI publishes)
