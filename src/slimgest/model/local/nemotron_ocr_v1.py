@@ -266,7 +266,7 @@ class NemotronOCRV1(BaseModel):
                 out.extend(self._model(input_data[i]))
             return out
 
-        results = self._model(input_data)
+        results = self._model(input_data, merge_level=merge_level)
         return results
 
     def postprocess(self, preds: List[Dict[str, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
