@@ -1,11 +1,10 @@
 import logging
 
 
-from nv_ingest_client.util.vdb.adt_vdb import VDB
+from slimgest.local.vdb.adt_vdb import VDB
 from datetime import timedelta
 from functools import partial
 from urllib.parse import urlparse
-from nv_ingest_client.util.transport import infer_microservice
 import lancedb
 import pyarrow as pa
 
@@ -188,7 +187,7 @@ class LanceDB(VDB):
         self,
         queries,
         table=None,
-        embedding_endpoint="http://localhost:8012/v1",
+        embed_model=None,
         nvidia_api_key=None,
         model_name="nvidia/llama-3.2-nv-embedqa-1b-v2",
         result_fields=["text", "metadata", "source"],
@@ -231,15 +230,6 @@ class LanceDB(VDB):
             example limits each query to 20 results.
         """
         table = table or self.table
-        embed_model = partial(
-            infer_microservice,
-            model_name=model_name,
-            embedding_endpoint=embedding_endpoint,
-            nvidia_api_key=nvidia_api_key,
-            input_type="query",
-            output_names=["embeddings"],
-            grpc=not ("http" in urlparse(embedding_endpoint).scheme),
-        )
         results = []
         query_embeddings = embed_model(queries)
         for query_embed in query_embeddings:

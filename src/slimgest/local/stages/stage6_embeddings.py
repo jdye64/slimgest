@@ -78,12 +78,13 @@ def run(
 
     console.print(f"[bold cyan]Stage6[/bold cyan] images={len(images)} input_dir={input_dir} device={dev}")
 
+    chunks_created = 0
     processed = 0
     skipped = 0
     missing_stage5 = 0
     bad_stage5 = 0
     missing_pdfium_text = 0
-    for img_path in tqdm(images, desc="Stage6 images", unit="img"):
+    for img_path in tqdm(images, desc=f"Stage6 images", unit="img"):
         out_path = _out_path_for_image(img_path)
         if out_path.exists() and not overwrite:
             skipped += 1
@@ -129,10 +130,12 @@ def run(
                     bboxes.append([0.0, 0.0, 0.0, 0.0])
                 text_kinds.append("ocr_region")
 
+        if len(texts) ==0:
+            skipped += 1
         t0 = time.perf_counter()
         vectors: List[torch.Tensor] = []
-        with torch.inference_mode():
-            if texts:
+        if texts:
+            with torch.inference_mode():
                 emb = embedder.embed(texts, batch_size=batch_size)  # [N, D] on CPU
                 for i in range(int(emb.shape[0])):
                     vec = normalize_l2(emb[i])
@@ -159,7 +162,7 @@ def run(
 
     console.print(
         f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage5={missing_stage5} bad_stage5={bad_stage5} "
-        f"missing_pdfium_text={missing_pdfium_text} wrote_pt_suffix=.embeddings.pt"
+        f"missing_pdfium_text={missing_pdfium_text} chunks_created={chunks_created} wrote_pt_suffix=.embeddings.pt"
     )
 
 
