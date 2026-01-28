@@ -139,8 +139,6 @@ def run(
                     vectors.append(vec)
         dt = time.perf_counter() - t0
 
-        emb = torch.stack(vectors, dim=0) if vectors else torch.empty((0, 0), dtype=torch.float32)
-
         torch.save(
             {
                 "schema_version": 1,
@@ -152,7 +150,7 @@ def run(
                 "texts": texts,
                 "text_kinds": text_kinds,
                 "bboxes_xyxy_norm_in_page": bboxes,
-                "embeddings": emb,
+                "embeddings": vectors,
                 "timing": {"seconds": float(dt)},
             },
             out_path,
