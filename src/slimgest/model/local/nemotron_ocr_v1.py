@@ -250,7 +250,7 @@ class NemotronOCRV1(BaseModel):
 
         return out
 
-    def invoke(self, input_data: torch.Tensor) -> List[Dict[str, torch.Tensor]]:
+    def invoke(self, input_data: torch.Tensor, merge_level: str = "paragraph") -> List[Dict[str, torch.Tensor]]:
         if self._endpoint is not None:
             # Remote NIM invocation. Note: returns list[dict] (not torch tensors).
             return self.invoke_remote(input_data, batch_size=self._remote_batch_size)  # type: ignore[return-value]

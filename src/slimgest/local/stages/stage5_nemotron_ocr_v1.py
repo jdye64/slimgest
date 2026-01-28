@@ -373,7 +373,7 @@ def run(
                             # Local pipeline is effectively per-image; keep "batch" boundaries
                             # for reporting/throughput visibility.
                             for t in batch:
-                                ocr_raw_outs.append(ocr.invoke(t))
+                                ocr_raw_outs.append(ocr.invoke(t, merge_level="paragraph"))
                     batch_dt = max(1e-9, time.perf_counter() - t_batch0)
 
                     processed_batches += 1
