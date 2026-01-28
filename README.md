@@ -175,9 +175,23 @@ Notes
 
 CI wheel publishing
 ------------------
-- A GitHub Actions workflow publishes a **nightly wheel to TestPyPI**.
+- A GitHub Actions workflow publishes a wheel to **TestPyPI**:
+  - **On every commit to `main`**
+  - **Nightly** on a schedule
 - Nightly TestPyPI builds use a version like `0.1.0.devYYYYMMDD+branch.sha` so the wheel filename includes the **UTC date**, **branch**, and **git short SHA**.
 - Manual runs can publish to **PyPI** (requires specifying `version`).
 - Required GitHub secrets:
   - `TEST_PYPI_API_TOKEN` (used for nightly/TestPyPI publishes)
   - `PYPI_API_TOKEN` (used only when manually publishing to PyPI)
+
+CUDA PyTorch (important)
+-----------------------
+If you install `torch` from default PyPI, you will often get a **CPU-only** build. Unfortunately, **you cannot reliably force “CUDA torch” purely via `pyproject.toml`** because:
+- CUDA-enabled PyTorch wheels are typically served from the PyTorch package index (via `--extra-index-url`), not something a wheel can enforce.
+- pip has no mechanism for a wheel to require a specific index URL at install time.
+
+Practical options:
+- **Document the install command (recommended)**:
+  - Example: `pip install --extra-index-url https://download.pytorch.org/whl/cu121 slimgest`
+- **Make GPU deps optional** (extras like `slimgest[cuda]`) and document the same `--extra-index-url` approach.
+- **Runtime guardrails**: at startup, detect `torch.cuda.is_available()` and emit a clear error/warning if CUDA is unavailable.

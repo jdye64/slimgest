@@ -1,6 +1,9 @@
 name: Build & publish slimgest wheel
 
 on:
+  push:
+    branches:
+      - main
   schedule:
     # Nightly (UTC)
     - cron: "0 3 * * *"
@@ -78,7 +81,7 @@ jobs:
           PUBLISH_TO_INPUT="${{ inputs.publish_to }}"
           VERSION_INPUT="${{ inputs.version }}"
 
-          if [[ "$EVENT" == "schedule" ]]; then
+          if [[ "$EVENT" == "schedule" || "$EVENT" == "push" ]]; then
             PUBLISH_TO="testpypi"
             BUILD_VERSION="${BASE_VERSION}.dev${DATE_UTC}+${SAN_BRANCH}.${SHA_SHORT}"
           else
