@@ -41,7 +41,7 @@ RUN /root/.local/bin/uv venv /opt/venv --python python3.12
 ENV PATH="/opt/venv/bin:${PATH}"
 
 # First install torch so we can more directly control the version and CUDA version
-RUN /root/.local/bin/uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+RUN /root/.local/bin/uv pip install torch==2.9.1 torchvision --index-url https://download.pytorch.org/whl/cu128
 
 # Install nemotron-ocr wheel first
 RUN /root/.local/bin/uv pip install /tmp/nemotron_ocr-1.0.0-py3-none-any.whl \
