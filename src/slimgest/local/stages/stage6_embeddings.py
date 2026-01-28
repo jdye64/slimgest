@@ -26,6 +26,27 @@ DEFAULT_INPUT_DIR = Path("./data/pages")
 def _stage5_json_for_image(img_path: Path) -> Path:
     return img_path.with_name(img_path.name + ".nemotron_ocr_v1.json")
 
+def _pdfium_text_for_image(img_path: Path) -> Path:
+    """
+    pdf.convert writes embedded PDF text as:
+      <pdf_basename>_page<NNNN>.pdfium_text.txt
+
+    For an image like:
+      <pdf_basename>_page<NNNN>.png
+
+    ...this corresponds to `img_path.with_suffix(".pdfium_text.txt")`.
+    """
+    return img_path.with_suffix(".pdfium_text.txt")
+
+
+def _read_text_file_best_effort(path: Path) -> str:
+    try:
+        s = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    # Keep internal newlines intact; just trim surrounding whitespace.
+    return s.strip()
+
 
 def _out_path_for_image(img_path: Path) -> Path:
     return img_path.with_name(img_path.name + ".embeddings.pt")
@@ -61,6 +82,7 @@ def run(
     skipped = 0
     missing_stage5 = 0
     bad_stage5 = 0
+    missing_pdfium_text = 0
     for img_path in tqdm(images, desc="Stage6 images", unit="img"):
         out_path = _out_path_for_image(img_path)
         if out_path.exists() and not overwrite:
@@ -72,6 +94,13 @@ def run(
             missing_stage5 += 1
             continue
 
+        pdfium_text_path = _pdfium_text_for_image(img_path)
+        pdfium_text = ""
+        if pdfium_text_path.exists():
+            pdfium_text = _read_text_file_best_effort(pdfium_text_path)
+        else:
+            missing_pdfium_text += 1
+
         try:
             s5 = read_json(s5_path)
         except Exception:
@@ -80,6 +109,15 @@ def run(
         regions: List[Dict[str, Any]] = list(s5.get("regions") or [])
         texts: List[str] = []
         bboxes: List[List[float]] = []
+        text_kinds: List[str] = []
+
+        # Include embedded PDF text (if present) as a full-page "region" so it is embedded
+        # alongside OCR detection text.
+        if pdfium_text:
+            texts.append(pdfium_text)
+            bboxes.append([0.0, 0.0, 1.0, 1.0])
+            text_kinds.append("pdfium_page_text")
+
         for r in regions:
             txt = (r.get("ocr_text") or "").strip()
             bbox = r.get("bbox_xyxy_norm_in_page")
@@ -89,6 +127,7 @@ def run(
                     bboxes.append([float(x) for x in bbox])
                 else:
                     bboxes.append([0.0, 0.0, 0.0, 0.0])
+                text_kinds.append("ocr_region")
 
         t0 = time.perf_counter()
         vectors: List[torch.Tensor] = []
@@ -109,7 +148,9 @@ def run(
                 "model": "llama_nemotron_embed_1b_v2",
                 "image_path": str(img_path),
                 "stage5_json": str(s5_path),
+                "pdfium_text_path": str(pdfium_text_path),
                 "texts": texts,
+                "text_kinds": text_kinds,
                 "bboxes_xyxy_norm_in_page": bboxes,
                 "embeddings": emb,
                 "timing": {"seconds": float(dt)},
@@ -119,7 +160,8 @@ def run(
         processed += 1
 
     console.print(
-        f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage5={missing_stage5} bad_stage5={bad_stage5} wrote_pt_suffix=.embeddings.pt"
+        f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage5={missing_stage5} bad_stage5={bad_stage5} "
+        f"missing_pdfium_text={missing_pdfium_text} wrote_pt_suffix=.embeddings.pt"
     )
 
 
