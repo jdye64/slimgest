@@ -172,3 +172,12 @@ Notes
 - Metrics are collected per phase (render, preprocess, ocr) and shown in the REST client summary and saved in local mode outputs.
 - Multiple rendering backends supported: pypdfium2, PyMuPDF, and pikepdf
 - Test files included for Nemotron page elements and table structure analysis
+
+CI wheel publishing
+------------------
+- A GitHub Actions workflow publishes a **nightly wheel to TestPyPI**.
+- Nightly TestPyPI builds use a version like `0.1.0.devYYYYMMDD+branch.sha` so the wheel filename includes the **UTC date**, **branch**, and **git short SHA**.
+- Manual runs can publish to **PyPI** (requires specifying `version`).
+- Required GitHub secrets:
+  - `TEST_PYPI_API_TOKEN` (used for nightly/TestPyPI publishes)
+  - `PYPI_API_TOKEN` (used only when manually publishing to PyPI)
