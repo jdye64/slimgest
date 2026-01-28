@@ -124,13 +124,16 @@ jobs:
           in_project = False
           replaced = False
           for line in lines:
+            nl = "\n" if line.endswith("\n") else ""
+            line_wo_nl = line[:-1] if nl else line
             if re.match(r"^\s*\[project\]\s*$", line):
               in_project = True
             elif in_project and re.match(r"^\s*\[.*\]\s*$", line):
               in_project = False
 
-            if in_project and not replaced and re.match(r'^\s*version\s*=\s*".*"\s*$', line):
-              out.append(re.sub(r'^\s*version\s*=\s*".*"\s*$', f'version = "{new_version}"', line))
+            # Preserve original newline; avoid patterns that can consume '\n'.
+            if in_project and not replaced and re.match(r'^\s*version\s*=\s*".*"\s*$', line_wo_nl):
+              out.append(f'version = "{new_version}"{nl}')
               replaced = True
             else:
               out.append(line)
