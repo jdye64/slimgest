@@ -68,48 +68,16 @@ def _embedder_input_path_for_image(img_path: Path) -> Path:
 def _write_embedder_input_txt(
     path: Path,
     *,
-    raw_texts: List[str],
     embedder_texts: List[str],
-    text_kinds: List[str],
-    bboxes_xyxy_norm_in_page: List[List[float]],
-    image_path: Path,
-    stage5_json_path: Path,
-    pdfium_text_path: Path,
 ) -> None:
     """
-    Write a human-readable text file to help validate what stage6 feeds into the embedder.
+    Write only the exact text fed into the embedder.
 
-    - raw_texts: text before "passage: " prefix
-    - embedder_texts: exact strings passed into tokenizer/embedder
+    The embedder receives a list of strings; this file writes them in order, with a
+    single newline between entries (no extra headers/metadata).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    lines: List[str] = []
-    lines.append(f"# image_path: {str(image_path)}")
-    lines.append(f"# stage5_json: {str(stage5_json_path)}")
-    lines.append(f"# pdfium_text_path: {str(pdfium_text_path)}")
-    lines.append(f"# num_inputs: {len(embedder_texts)}")
-    lines.append("")
-    lines.append("# Each block below is one embedder input (exact), preceded by metadata comments.")
-    lines.append("")
-
-    for i in range(len(embedder_texts)):
-        kind = text_kinds[i] if i < len(text_kinds) else "unknown"
-        bbox = bboxes_xyxy_norm_in_page[i] if i < len(bboxes_xyxy_norm_in_page) else None
-        raw = raw_texts[i] if i < len(raw_texts) else ""
-        emb_in = embedder_texts[i]
-
-        lines.append(f"# --- input_index: {i}")
-        lines.append(f"# kind: {kind}")
-        if bbox is not None:
-            lines.append(f"# bbox_xyxy_norm_in_page: {bbox}")
-        lines.append("# --- raw_text (pre-prefix) ---")
-        lines.append(raw)
-        lines.append("# --- embedder_text (exact input) ---")
-        lines.append(emb_in)
-        lines.append("")  # block separator
-
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8", errors="replace")
+    path.write_text("\n".join(embedder_texts).rstrip() + "\n", encoding="utf-8", errors="replace")
 
 
 @app.command()
@@ -118,6 +86,11 @@ def run(
     device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", help="Device for embedding model."),
     overwrite: bool = typer.Option(False, "--overwrite", help="Overwrite existing .pt outputs."),
     limit: Optional[int] = typer.Option(None, help="Optionally limit number of images processed."),
+    hf_cache_dir: Path = typer.Option(
+        Path.home() / ".cache" / "huggingface",
+        "--hf-cache-dir",
+        help="Local cache dir for large model files (e.g. model.safetensors).",
+    ),
     embedding_endpoint: Optional[str] = typer.Option(
         None,
         help="Optional embedding endpoint URL (often OpenAI-compatible '/v1/embeddings'). If set, embeddings run remotely and the local embedding model is not loaded.",
@@ -134,19 +107,33 @@ def run(
     ),
 ):
     dev = torch.device(device)
-    # Use the shared embedder wrapper; if endpoint is set, it runs remotely.
-    embed_model = llama_nemotron_embed_1b_v2.load_model('cuda:0', True, None, True)
-    tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer("longest_first")
+    # Ensure the cache directory exists so large weights are reused across runs.
+    hf_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    # IMPORTANT: force_download=True will re-download huge weights every run. Keep it False.
+    embed_model = llama_nemotron_embed_1b_v2.load_model(
+        device=str(dev),
+        trust_remote_code=True,
+        cache_dir=str(hf_cache_dir),
+        force_download=False,
+    )
+    tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer(
+        cache_dir=str(hf_cache_dir),
+        force_download=False,
+    )
 
     images = iter_images(input_dir)
     if limit is not None:
         images = images[: int(limit)]
 
-    console.print(f"[bold cyan]Stage6[/bold cyan] images={len(images)} input_dir={input_dir} device={dev}")
+    console.print(
+        f"[bold cyan]Stage6[/bold cyan] images={len(images)} input_dir={input_dir} device={dev} hf_cache_dir={hf_cache_dir}"
+    )
 
     chunks_created = 0
     processed = 0
     skipped = 0
+    oom_errors = 0
     missing_stage5 = 0
     bad_stage5 = 0
     missing_pdfium_text = 0
@@ -205,29 +192,67 @@ def run(
             skipped += 1
         t0 = time.perf_counter()
         vectors: List[torch.Tensor] = []
-        if texts:
-            with torch.inference_mode():
-                raw_texts = list(texts)
-                texts = ["passage: " + text for text in raw_texts]
-                if write_embedder_input:
-                    _write_embedder_input_txt(
-                        _embedder_input_path_for_image(img_path),
-                        raw_texts=raw_texts,
-                        embedder_texts=texts,
-                        text_kinds=text_kinds,
-                        bboxes_xyxy_norm_in_page=bboxes,
-                        image_path=img_path,
-                        stage5_json_path=s5_path,
-                        pdfium_text_path=pdfium_text_path,
-                    )
-                tokenized_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(dev)
-                embed_model_results = embed_model(**tokenized_inputs)
-                emb = average_pool(embed_model_results.last_hidden_state, tokenized_inputs['attention_mask'])
-                # emb = embedder.embed(texts, batch_size=batch_size)  # [N, D] on CPU
+        try:
+            if texts:
+                with torch.inference_mode():
+                    raw_texts = list(texts)
+                    texts = ["passage: " + text for text in raw_texts]
+                    if write_embedder_input:
+                        _write_embedder_input_txt(
+                            _embedder_input_path_for_image(img_path),
+                            embedder_texts=texts,
+                        )
+                    tokenized_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(dev)
+                    embed_model_results = embed_model(**tokenized_inputs)
+                    emb = average_pool(embed_model_results.last_hidden_state, tokenized_inputs["attention_mask"])
+                    # emb = embedder.embed(texts, batch_size=batch_size)  # [N, D] on CPU
 
-                for i in range(int(emb.shape[0])):
-                    # vec = normalize_l2(emb[i])
-                    vectors.append(emb[i].cpu().numpy().astype(np.float32))
+                    for i in range(int(emb.shape[0])):
+                        vectors.append(emb[i].cpu().numpy().astype(np.float32))
+        except torch.cuda.OutOfMemoryError as e:
+            oom_errors += 1
+            console.print(
+                f"[bold red]CUDA OOM[/bold red] while embedding {img_path} "
+                f"(skipping this page and continuing): {e}"
+            )
+            # Best-effort cleanup so we can continue.
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+            continue
+        except RuntimeError as e:
+            # Some CUDA OOMs surface as generic RuntimeError("CUDA out of memory ...").
+            msg = str(e)
+            if "CUDA out of memory" in msg or "cuda out of memory" in msg:
+                oom_errors += 1
+                console.print(
+                    f"[bold red]CUDA OOM[/bold red] while embedding {img_path} "
+                    f"(skipping this page and continuing): {e}"
+                )
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+                continue
+            raise
+        finally:
+            # Release any large tensors promptly between pages.
+            try:
+                del tokenized_inputs  # type: ignore[name-defined]
+            except Exception:
+                pass
+            try:
+                del embed_model_results  # type: ignore[name-defined]
+            except Exception:
+                pass
+            try:
+                del emb  # type: ignore[name-defined]
+            except Exception:
+                pass
+
         dt = time.perf_counter() - t0
         chunks_created += len(texts)
 
@@ -251,7 +276,7 @@ def run(
 
     console.print(
         f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage5={missing_stage5} bad_stage5={bad_stage5} "
-        f"missing_pdfium_text={missing_pdfium_text} chunks_created={chunks_created} texts_added={texts_added} ocr_added={ocr_added} wrote_pt_suffix=.embeddings.pt"
+        f"missing_pdfium_text={missing_pdfium_text} oom_errors={oom_errors} chunks_created={chunks_created} texts_added={texts_added} ocr_added={ocr_added} wrote_pt_suffix=.embeddings.pt"
     )
 
 

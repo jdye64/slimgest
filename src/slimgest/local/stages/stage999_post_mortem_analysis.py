@@ -195,6 +195,8 @@ def _paths_for_image(img_path: Path) -> Dict[str, Path]:
         "stage3": img_path.with_name(img_path.name + ".graphic_elements_v1.json"),
         "stage4": img_path.with_name(img_path.name + ".table_structure_v1.json"),
         "stage5": img_path.with_name(img_path.name + ".nemotron_ocr_v1.json"),
+        # Stage6 writes this (see stage6_embeddings.py): <image>.+embedder-input.txt
+        "embedder_input": img_path.with_name(img_path.name + ".embedder-input.txt"),
     }
 
 
@@ -502,6 +504,113 @@ def _export_report_pdf(
     output_pdf.write_bytes(pdf_bytes)
 
 
+def _gather_results_zip(
+    *,
+    examples: Sequence[ResolvedExample],
+    input_dir: Path,
+    csv_path: Path,
+    zip_path: Path,
+    recursive: bool,
+    limit_unique_pages: Optional[int] = None,
+) -> None:
+    """
+    Gather the artifacts used by the UI into a single shareable zip:
+      - the CSV
+      - resolved page images + adjacent artifacts (if present)
+      - a manifest.json with pointers + basic stats
+    """
+    import time
+    import zipfile
+
+    input_dir = Path(input_dir)
+    zip_path = Path(zip_path)
+    zip_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Unique pages in stable order.
+    uniq: Dict[Path, QueryRow] = {}
+    for ex in examples:
+        if ex.image_path is None or (not ex.image_path.exists()):
+            continue
+        uniq.setdefault(ex.image_path, ex.row)
+    page_items = sorted(uniq.items(), key=lambda kv: kv[0].name)
+    if limit_unique_pages is not None:
+        page_items = page_items[: int(limit_unique_pages)]
+
+    # Helper to store files under a stable namespace.
+    def _arc_for(p: Path) -> str:
+        try:
+            rel = p.resolve().relative_to(input_dir.resolve())
+            return str(Path("pages") / rel)
+        except Exception:
+            # Not under input_dir (or resolve fails); fall back to basename.
+            return str(Path("pages") / p.name)
+
+    manifest: Dict[str, Any] = {
+        "schema_version": 1,
+        "created_unix_s": int(time.time()),
+        "input_dir": str(input_dir),
+        "recursive": bool(recursive),
+        "csv_path": str(csv_path),
+        "counts": {
+            "csv_rows": int(len(examples)),
+            "unique_pages_resolved": int(len(page_items)),
+            "unique_pages_limit": int(limit_unique_pages) if limit_unique_pages is not None else None,
+        },
+        "entries": [],
+    }
+
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        # Include the CSV verbatim.
+        try:
+            zf.write(csv_path, arcname="bo767_query_gt.csv")
+        except Exception:
+            # still allow zip creation even if CSV isn't readable for some reason
+            pass
+
+        # Include a small readme to guide recipients.
+        readme = (
+            "slimgest stage999 gathered results\n"
+            "\n"
+            "Contents:\n"
+            "- bo767_query_gt.csv: original query->pdf_page mapping\n"
+            "- pages/: resolved page images and adjacent artifacts (sidecar JSON, pdfium text, overlay, embedder input)\n"
+            "- manifest.json: what was included and how it maps to the CSV\n"
+        )
+        zf.writestr("README.txt", readme)
+
+        # Add per-page artifacts
+        for img_path, row in page_items:
+            paths = _paths_for_image(img_path)
+            files: List[Tuple[str, Path]] = []
+            for k in ("img", "img_overlay", "pdfium_text", "stage2", "stage3", "stage4", "stage5", "embedder_input"):
+                p = paths.get(k)
+                if isinstance(p, Path) and p.exists():
+                    files.append((k, p))
+
+            # Write files into zip
+            included: Dict[str, str] = {}
+            for kind, p in files:
+                arc = _arc_for(p)
+                # Avoid overwriting if collisions happen; disambiguate with a prefix.
+                if arc in zf.namelist():
+                    arc = str(Path("pages") / f"{img_path.stem}__{p.name}")
+                zf.write(p, arcname=arc)
+                included[kind] = arc
+
+            manifest["entries"].append(
+                {
+                    "pdf_page": row.pdf_page,
+                    "query": row.query,
+                    "modality": row.modality,
+                    "image_name": img_path.name,
+                    "included": included,
+                }
+            )
+
+        # Always write manifest at end.
+        zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+
+
 def _run_ui(*, examples: Sequence[ResolvedExample], global_metrics: Dict[str, Any]) -> None:
     # Tk is stdlib; pillow is project dependency.
     import tkinter as tk
@@ -605,6 +714,7 @@ def _run_ui(*, examples: Sequence[ResolvedExample], global_metrics: Dict[str, An
 
     pdfium_text = _make_text_tab("PDFium text")
     det_text = _make_text_tab("Detections / OCR / metrics")
+    embedder_input_text = _make_text_tab("Embedder input")
     raw_text = _make_text_tab("Raw JSON")
 
     # Keep references to images to prevent GC.
@@ -730,6 +840,7 @@ def _run_ui(*, examples: Sequence[ResolvedExample], global_metrics: Dict[str, An
             _render_image_to_label(overlay_lbl, None)
             _set_text(pdfium_text, "")
             _set_text(det_text, "")
+            _set_text(embedder_input_text, "")
             _set_text(raw_text, "")
             return
 
@@ -743,10 +854,16 @@ def _run_ui(*, examples: Sequence[ResolvedExample], global_metrics: Dict[str, An
         if s is None:
             _set_text(pdfium_text, "")
             _set_text(det_text, "")
+            _set_text(embedder_input_text, "")
             _set_text(raw_text, "")
             return
         _set_text(pdfium_text, s.get("pdfium_text") or "")
         _set_text(det_text, _summary_text(s))
+        embed_path = paths.get("embedder_input")
+        if isinstance(embed_path, Path) and embed_path.exists():
+            _set_text(embedder_input_text, _read_text_best_effort(embed_path) + "\n")
+        else:
+            _set_text(embedder_input_text, "")
         raw = s.get("raw") or {}
         raw_blob = "\n\n".join(
             [
@@ -806,6 +923,17 @@ def run(
         min=1,
         help="Optional limit on number of unique pages included in the exported report.",
     ),
+    gather_results: Optional[Path] = typer.Option(
+        None,
+        "--gather-results",
+        help="If set, writes a .zip containing all artifacts used by the UI (images, sidecars, text, overlays, embedder-input) plus a manifest.",
+    ),
+    gather_limit_unique_pages: Optional[int] = typer.Option(
+        None,
+        "--gather-limit-unique-pages",
+        min=1,
+        help="Optional limit on number of unique pages included in the gathered .zip.",
+    ),
     also_ui: bool = typer.Option(False, "--also-ui", help="If --export-pdf is set, still open the UI after exporting."),
 ):
     """
@@ -848,6 +976,21 @@ def run(
         console.print(f"[green]Export complete[/green] output={out}")
         if not also_ui:
             return
+
+    if gather_results is not None:
+        out_zip = Path(gather_results)
+        if out_zip.suffix.lower() != ".zip":
+            out_zip = out_zip.with_suffix(out_zip.suffix + ".zip") if out_zip.suffix else out_zip.with_suffix(".zip")
+        console.print(f"[cyan]Gathering results[/cyan] output={out_zip}")
+        _gather_results_zip(
+            examples=resolved,
+            input_dir=input_dir,
+            csv_path=csv_path,
+            zip_path=out_zip,
+            recursive=recursive,
+            limit_unique_pages=gather_limit_unique_pages,
+        )
+        console.print(f"[green]Gather complete[/green] output={out_zip}")
 
     _run_ui(examples=resolved, global_metrics=global_metrics)
 
