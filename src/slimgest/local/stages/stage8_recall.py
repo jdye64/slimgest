@@ -35,7 +35,6 @@ def calculate_recall(real_answers, retrieved_answers, k):
     for real, retrieved in zip(real_answers, retrieved_answers):
         if real in retrieved[:k]:
             hits += 1
-    breakpoint()
     return hits / len(real_answers)
 
 

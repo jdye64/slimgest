@@ -41,14 +41,14 @@ def run(
     bad_stage5 = 0
     missing_pdfium_text = 0
     full_chunks = []
-    for file_path in tqdm(files_to_read, desc="Stage7 embeddings", unit="pt file"):
+    for file_path in tqdm(files_to_read, desc="Stage7 creating_chunks", unit="pt file"):
         # create chunks
         with open(file_path, "rb") as f:
             data = torch.load(f, weights_only=False)
         for emb, text in zip(data["embeddings"], data["texts"]):
             if emb is not None and text:
                 chunk = {
-                    "embedding": emb,
+                    "embedding": emb.numpy() if hasattr(emb, "numpy") else emb,
                     "content": text,
                     "source_id": file_path,
                     "page_number": int(file_path.split("_page")[-1].split(".")[0]),
@@ -63,7 +63,6 @@ def run(
     vdb.run(full_chunks)
 
     processed = vdb.table.count_rows()
-
 
     console.print(
         f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage5={missing_stage5} bad_stage5={bad_stage5} "
