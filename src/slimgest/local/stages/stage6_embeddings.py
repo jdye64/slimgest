@@ -60,6 +60,57 @@ def _read_text_file_best_effort(path: Path) -> str:
 def _out_path_for_image(img_path: Path) -> Path:
     return img_path.with_name(img_path.name + ".embeddings.pt")
 
+def _embedder_input_path_for_image(img_path: Path) -> Path:
+    # Intentionally uses a "double extension" so it's easy to spot in a pages dir.
+    # Example: foo_page0001.png.embedder-input.txt
+    return img_path.with_name(img_path.name + ".embedder-input.txt")
+
+def _write_embedder_input_txt(
+    path: Path,
+    *,
+    raw_texts: List[str],
+    embedder_texts: List[str],
+    text_kinds: List[str],
+    bboxes_xyxy_norm_in_page: List[List[float]],
+    image_path: Path,
+    stage5_json_path: Path,
+    pdfium_text_path: Path,
+) -> None:
+    """
+    Write a human-readable text file to help validate what stage6 feeds into the embedder.
+
+    - raw_texts: text before "passage: " prefix
+    - embedder_texts: exact strings passed into tokenizer/embedder
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: List[str] = []
+    lines.append(f"# image_path: {str(image_path)}")
+    lines.append(f"# stage5_json: {str(stage5_json_path)}")
+    lines.append(f"# pdfium_text_path: {str(pdfium_text_path)}")
+    lines.append(f"# num_inputs: {len(embedder_texts)}")
+    lines.append("")
+    lines.append("# Each block below is one embedder input (exact), preceded by metadata comments.")
+    lines.append("")
+
+    for i in range(len(embedder_texts)):
+        kind = text_kinds[i] if i < len(text_kinds) else "unknown"
+        bbox = bboxes_xyxy_norm_in_page[i] if i < len(bboxes_xyxy_norm_in_page) else None
+        raw = raw_texts[i] if i < len(raw_texts) else ""
+        emb_in = embedder_texts[i]
+
+        lines.append(f"# --- input_index: {i}")
+        lines.append(f"# kind: {kind}")
+        if bbox is not None:
+            lines.append(f"# bbox_xyxy_norm_in_page: {bbox}")
+        lines.append("# --- raw_text (pre-prefix) ---")
+        lines.append(raw)
+        lines.append("# --- embedder_text (exact input) ---")
+        lines.append(emb_in)
+        lines.append("")  # block separator
+
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8", errors="replace")
+
 
 @app.command()
 def run(
@@ -76,6 +127,11 @@ def run(
         help="Optional embedding model name for remote endpoint (sent as 'model' in payload).",
     ),
     batch_size: int = typer.Option(64, "--batch-size", min=1, help="Embedding batch size (texts per request)."),
+    write_embedder_input: bool = typer.Option(
+        True,
+        "--write-embedder-input/--no-write-embedder-input",
+        help="Write a per-page .embedder-input.txt file showing the exact text fed to the embedder.",
+    ),
 ):
     dev = torch.device(device)
     # Use the shared embedder wrapper; if endpoint is set, it runs remotely.
@@ -151,7 +207,19 @@ def run(
         vectors: List[torch.Tensor] = []
         if texts:
             with torch.inference_mode():
-                texts = ["passage: " + text for text in texts]
+                raw_texts = list(texts)
+                texts = ["passage: " + text for text in raw_texts]
+                if write_embedder_input:
+                    _write_embedder_input_txt(
+                        _embedder_input_path_for_image(img_path),
+                        raw_texts=raw_texts,
+                        embedder_texts=texts,
+                        text_kinds=text_kinds,
+                        bboxes_xyxy_norm_in_page=bboxes,
+                        image_path=img_path,
+                        stage5_json_path=s5_path,
+                        pdfium_text_path=pdfium_text_path,
+                    )
                 tokenized_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(dev)
                 embed_model_results = embed_model(**tokenized_inputs)
                 emb = average_pool(embed_model_results.last_hidden_state, tokenized_inputs['attention_mask'])

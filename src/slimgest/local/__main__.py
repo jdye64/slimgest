@@ -14,6 +14,7 @@ from .stages import (
     stage7_vdb_upload,
     stage8_recall,
     report_stage_outputs,
+    stage999_post_mortem_analysis,
 )
 
 app = typer.Typer(help="Simplest pipeline with limited CPU parallelism while using maximum GPU possible")
@@ -28,6 +29,7 @@ app.add_typer(stage6_embeddings.app, name="stage6")
 app.add_typer(stage7_vdb_upload.app, name="stage7")
 app.add_typer(stage8_recall.app, name="stage8")
 app.add_typer(report_stage_outputs.app, name="report")
+app.add_typer(stage999_post_mortem_analysis.app, name="stage999")
 
 
 def main():

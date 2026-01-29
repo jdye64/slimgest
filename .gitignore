@@ -36,3 +36,5 @@ output/
 
 # Ignore lancedb directory
 lancedb/
+
+longest_first/
