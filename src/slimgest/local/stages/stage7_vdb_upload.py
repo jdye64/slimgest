@@ -11,8 +11,6 @@ import typer
 from tqdm import tqdm
 import glob
 
-from ._io import coerce_embedding_to_vector, iter_images, normalize_l2, read_json
-from slimgest.model.local.llama_nemotron_embed_1b_v2_embedder import LlamaNemotronEmbed1BV2Embedder
 from slimgest.local.vdb.lancedb import LanceDB
 
 
@@ -46,17 +44,16 @@ def run(
     for file_path in tqdm(files_to_read, desc="Stage7 embeddings", unit="pt file"):
         # create chunks
         with open(file_path, "rb") as f:
-            data = torch.load(f)
+            data = torch.load(f, weights_only=False)
         for emb, text in zip(data["embeddings"], data["texts"]):
             if emb is not None and text:
                 chunk = {
-                    "embedding": emb.numpy(),
+                    "embedding": emb,
                     "content": text,
                     "source_id": file_path,
                     "page_number": int(file_path.split("_page")[-1].split(".")[0]),
                 }
                 full_chunks.append(chunk)
-                processed += 1
             else:
                 skipped += 1
 
@@ -64,6 +61,9 @@ def run(
 
     vdb = LanceDB(overwrite=True)
     vdb.run(full_chunks)
+
+    processed = vdb.table.count_rows()
+
 
     console.print(
         f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage5={missing_stage5} bad_stage5={bad_stage5} "

@@ -11,7 +11,8 @@ import torch.nn.functional as F
 import typer
 from tqdm import tqdm
 
-from slimgest.model.local.nemotron_ocr_v1 import NemotronOCRV1
+# from slimgest.model.local.nemotron_ocr_v1 import NemotronOCRV1
+from nemotron_ocr.inference.pipeline import NemotronOCR
 
 from ._io import crop_tensor_normalized_xyxy, load_image_rgb_chw_u8, read_json, write_json
 
@@ -202,7 +203,8 @@ def run(
     device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", help="Device for tensors/model (single-device only)."),
     batch_size: int = typer.Option(16, "--batch-size", min=1, help="Target number of crops per OCR batch."),
     ocr_model_dir: Path = typer.Option(
-        Path("/raid/jdyer/slimgest/models/nemotron-ocr-v1/checkpoints"),
+        # Path("/raid/jdyer/slimgest/models/nemotron-ocr-v1/checkpoints"),
+        Path("/raid/slimgest/models/models--nvidia--nemotron-ocr-v1/snapshots/90015d3b851ba898ca842f18e948690af49c2427/checkpoints"),
         "--ocr-model-dir",
         help="Local nemotron-ocr-v1 checkpoints directory (ignored if --ocr-endpoint is set).",
     ),
@@ -310,12 +312,12 @@ def run(
         return
 
     with timers.timed("05_init_model"):
-        ocr = NemotronOCRV1(
+        ocr = NemotronOCR(
             model_dir=str(ocr_model_dir),
-            endpoint=str(ocr_endpoint).strip() if ocr_endpoint else None,
-            remote_batch_size=int(remote_batch_size),
+            # endpoint=str(ocr_endpoint).strip() if ocr_endpoint else None,
+            # remote_batch_size=int(remote_batch_size),
         )
-
+    breakpoint()
     processed_images = 0
     skipped_images = 0
     processed_crops = 0
@@ -368,12 +370,12 @@ def run(
                     with timers.timed("09_model_invoke"):
                         if ocr_endpoint:
                             b = torch.stack([t if t.ndim == 3 else t.squeeze(0) for t in batch], dim=0)
-                            ocr_raw_outs.extend(list(ocr.invoke(b)))
+                            ocr_raw_outs.extend(list(ocr._process_tensor(b, "paragraph")))
                         else:
                             # Local pipeline is effectively per-image; keep "batch" boundaries
                             # for reporting/throughput visibility.
                             for t in batch:
-                                ocr_raw_outs.append(ocr.invoke(t, merge_level="paragraph"))
+                                ocr_raw_outs.append(ocr._process_tensor(t, merge_level="paragraph"))
                     batch_dt = max(1e-9, time.perf_counter() - t_batch0)
 
                     processed_batches += 1

@@ -13,8 +13,10 @@ import pandas as pd
 import os
 import torch.nn.functional as F
 
+import llama_nemotron_embed_1b_v2
 
-from slimgest.model.local.llama_nemotron_embed_1b_v2_embedder import LlamaNemotronEmbed1BV2Embedder
+# from slimgest.model.local.llama_nemotron_embed_1b_v2_embedder import LlamaNemotronEmbed1BV2Embedder
+# import slimgest.model.local.llama_nemotron_embed_1b_v2_embedder as llama_nemotron_embed_1b_v2
 from slimgest.local.vdb.lancedb import LanceDB
 import lancedb
 
@@ -33,6 +35,7 @@ def calculate_recall(real_answers, retrieved_answers, k):
     for real, retrieved in zip(real_answers, retrieved_answers):
         if real in retrieved[:k]:
             hits += 1
+    breakpoint()
     return hits / len(real_answers)
 
 
@@ -65,7 +68,7 @@ def create_lancedb_results(results):
 def format_retrieved_answers_lance(all_answers):
     retrieved_pdf_pages = []
     for answers in all_answers:
-        retrieved_pdfs = [os.path.basename(result['source']).split('.')[0] for result in answers]
+        retrieved_pdfs = [os.path.basename(result['source']).split('_')[0] for result in answers]
         retrieved_pages = [str(result['metadata']) for result in answers]
         retrieved_pdf_pages.append([f"{pdf}_{page}" for pdf, page in zip(retrieved_pdfs, retrieved_pages)])
     return retrieved_pdf_pages
@@ -89,11 +92,12 @@ def run(
 ):
     processed = 0
     skipped = 0
-    embed_model = LlamaNemotronEmbed1BV2Embedder(normalize=True)
+    embed_model = llama_nemotron_embed_1b_v2.load_model('cuda:0', True, None, True)
+    tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer("longest_first")
+
     db = lancedb.connect(uri="lancedb")
     table = db.open_table("nv-ingest")
 
-    breakpoint()
     # Use the shared embedder wrapper; if endpoint is set, it runs remotely.
     df_query = pd.read_csv(query_file).rename(columns={'gt_page':'page'})[['query','pdf','page']]
     df_query['pdf_page'] = df_query.apply(lambda x: f"{x.pdf}_{x.page}", axis=1) 
@@ -107,11 +111,13 @@ def run(
     result_fields = ["source", "metadata", "text"]
     query_embeddings = []
     for query_batch in tqdm(query_texts, desc="Stage8 query embeddings", unit="queries"):
-        query_embeddings += embed_model.embed(["query: " + query_batch])
-        # query_embeddings += average_pool(query_model_results.last_hidden_state, query_tokens['attention_mask'])
+        tokenized_inputs = tokenizer(["query: " + query_batch], return_tensors="pt", padding=True, truncation=True).to(device)
+        embed_model_results = embed_model(**tokenized_inputs)
+        emb = average_pool(embed_model_results.last_hidden_state, tokenized_inputs['attention_mask']).detach().cpu().numpy()
+        query_embeddings.append(emb)
     for query_embed in tqdm(query_embeddings, desc="Stage8 querying VDB", unit="queries"): 
         all_answers.append(
-            table.search([query_embed.detach().cpu().numpy()], vector_column_name="vector").select(result_fields).limit(top_k).to_list()
+            table.search(query_embed, vector_column_name="vector").select(result_fields).limit(top_k).to_list()
         )
         processed += 1
     retrieved_pdf_pages = format_retrieved_answers_lance(all_answers)

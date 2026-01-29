@@ -11,8 +11,11 @@ import typer
 from tqdm import tqdm
 
 from ._io import coerce_embedding_to_vector, iter_images, normalize_l2, read_json
-from slimgest.model.local.llama_nemotron_embed_1b_v2_embedder import LlamaNemotronEmbed1BV2Embedder
-
+# import slimgest.model.local.llama_nemotron_embed_1b_v2_embedder as llama_nemotron_embed_1b_v2
+import numpy as np
+# from slimgest.model.local.llama_nemotron_embed_1b_v2_embedder import LlamaNemotronEmbed1BV2Embedder
+import llama_nemotron_embed_1b_v2
+import torch.nn.functional as F
 
 install(show_locals=False)
 console = Console()
@@ -22,6 +25,12 @@ app = typer.Typer(
 
 DEFAULT_INPUT_DIR = Path("./data/pages")
 
+def average_pool(last_hidden_states, attention_mask):
+    """Average pooling with attention mask."""
+    last_hidden_states_masked = last_hidden_states.masked_fill(~attention_mask[..., None].bool(), 0.0)
+    embedding = last_hidden_states_masked.sum(dim=1) / attention_mask.sum(dim=1)[..., None]
+    embedding = F.normalize(embedding, dim=-1)
+    return embedding
 
 def _stage5_json_for_image(img_path: Path) -> Path:
     return img_path.with_name(img_path.name + ".nemotron_ocr_v1.json")
@@ -70,7 +79,8 @@ def run(
 ):
     dev = torch.device(device)
     # Use the shared embedder wrapper; if endpoint is set, it runs remotely.
-    embedder = LlamaNemotronEmbed1BV2Embedder(endpoint=embedding_endpoint, model_name=embedding_model_name, normalize=True)
+    embed_model = llama_nemotron_embed_1b_v2.load_model('cuda:0', True, None, True)
+    tokenizer = llama_nemotron_embed_1b_v2.load_tokenizer("longest_first")
 
     images = iter_images(input_dir)
     if limit is not None:
@@ -84,6 +94,8 @@ def run(
     missing_stage5 = 0
     bad_stage5 = 0
     missing_pdfium_text = 0
+    texts_added = 0
+    ocr_added = 0
     for img_path in tqdm(images, desc=f"Stage6 images", unit="img"):
         out_path = _out_path_for_image(img_path)
         if out_path.exists() and not overwrite:
@@ -118,6 +130,8 @@ def run(
             texts.append(pdfium_text)
             bboxes.append([0.0, 0.0, 1.0, 1.0])
             text_kinds.append("pdfium_page_text")
+            texts_added += 1
+
 
         for r in regions:
             txt = (r.get("ocr_text") or "").strip()
@@ -129,6 +143,7 @@ def run(
                 else:
                     bboxes.append([0.0, 0.0, 0.0, 0.0])
                 text_kinds.append("ocr_region")
+                ocr_added += 1
 
         if len(texts) ==0:
             skipped += 1
@@ -136,11 +151,17 @@ def run(
         vectors: List[torch.Tensor] = []
         if texts:
             with torch.inference_mode():
-                emb = embedder.embed(texts, batch_size=batch_size)  # [N, D] on CPU
+                texts = ["passage: " + text for text in texts]
+                tokenized_inputs = tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(dev)
+                embed_model_results = embed_model(**tokenized_inputs)
+                emb = average_pool(embed_model_results.last_hidden_state, tokenized_inputs['attention_mask'])
+                # emb = embedder.embed(texts, batch_size=batch_size)  # [N, D] on CPU
+
                 for i in range(int(emb.shape[0])):
-                    vec = normalize_l2(emb[i])
-                    vectors.append(vec)
+                    # vec = normalize_l2(emb[i])
+                    vectors.append(emb[i].cpu().numpy().astype(np.float32))
         dt = time.perf_counter() - t0
+        chunks_created += len(texts)
 
         torch.save(
             {
@@ -162,7 +183,7 @@ def run(
 
     console.print(
         f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage5={missing_stage5} bad_stage5={bad_stage5} "
-        f"missing_pdfium_text={missing_pdfium_text} chunks_created={chunks_created} wrote_pt_suffix=.embeddings.pt"
+        f"missing_pdfium_text={missing_pdfium_text} chunks_created={chunks_created} texts_added={texts_added} ocr_added={ocr_added} wrote_pt_suffix=.embeddings.pt"
     )
 
 
