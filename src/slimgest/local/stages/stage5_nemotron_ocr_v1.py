@@ -272,11 +272,26 @@ def run(
         for p in stage2_jsons:
             _add_tasks_from_stage2_json(p)
 
-    images = sorted(tasks_by_image.keys())
+    # Include all images from stage2 JSONs, even those with no target detections
+    all_images_from_jsons = set()
+    for json_path in stage2_jsons:
+        try:
+            blob = read_json(json_path)
+            img_path = _resolve_image_path(input_dir, json_path, blob, STAGE2_SUFFIX)
+            if img_path.exists():
+                all_images_from_jsons.add(img_path)
+                # Ensure image is in prereq_by_image even if it has no tasks
+                if img_path not in prereq_by_image:
+                    prereq_by_image[img_path] = {"stage2_json": json_path}
+        except Exception:
+            pass
+
+    # Combine images with tasks and images without tasks
+    images = sorted(all_images_from_jsons.union(tasks_by_image.keys()))
     if limit is not None:
         images = images[: int(limit)]
 
-    total_crops = int(sum(len(tasks_by_image[p]) for p in images))
+    total_crops = int(sum(len(tasks_by_image.get(p, [])) for p in images))
     total_batches = int((total_crops + int(batch_size) - 1) // int(batch_size)) if total_crops > 0 else 0
 
     console.print(
@@ -288,36 +303,17 @@ def run(
     )
 
     if total_crops == 0:
-        report = {
-            "schema_version": 1,
-            "stage": 5,
-            "model": "nemotron_ocr_v1",
-            "input_dir": str(input_dir),
-            "output_dir": str(out_dir),
-            "device": str(dev),
-            "batch_size": int(batch_size),
-            "resize_to_1024": bool(resize_to_1024),
-            "counts": {
-                "images_with_detections": 0,
-                "total_detections": 0,
-                "total_batches": 0,
-                "bad_json": int(bad_json),
-                "missing_image": int(missing_image),
-            },
-            "timing_s": timers.as_dict(),
-            "wall_s": sw_total.elapsed_s(),
-        }
-        write_json(out_dir / "stage5_nemotron_ocr_v1.report.json", report)
-        console.print("[yellow]No table/chart/infographic detections found in stage2 JSONs; wrote report and exiting.[/yellow]")
-        return
-
-    with timers.timed("05_init_model"):
-        ocr = NemotronOCR(
-            model_dir=str(ocr_model_dir),
-            # endpoint=str(ocr_endpoint).strip() if ocr_endpoint else None,
-            # remote_batch_size=int(remote_batch_size),
-        )
-    breakpoint()
+        console.print("[yellow]No table/chart/infographic detections found in stage2 JSONs.[/yellow]")
+        # Don't return early - we still want to create empty output files for all images
+        # Skip model initialization since we won't need OCR
+        ocr = None
+    else:
+        with timers.timed("05_init_model"):
+            ocr = NemotronOCR(
+                model_dir=str(ocr_model_dir),
+                # endpoint=str(ocr_endpoint).strip() if ocr_endpoint else None,
+                # remote_batch_size=int(remote_batch_size),
+            )
     processed_images = 0
     skipped_images = 0
     processed_crops = 0
@@ -339,10 +335,46 @@ def run(
 
         tasks = tasks_by_image.get(img_path, [])
         if not tasks:
-            p_imgs.update(1)
+            # Write an empty output file even when there are no detections
+            # so downstream scripts have a file to open
+            try:
+                with timers.timed("06_load_image"):
+                    page_tensor, (h, w) = load_image_rgb_chw_u8(img_path, dev)
+                
+                payload: Dict[str, Any] = {
+                    "schema_version": 1,
+                    "stage": 5,
+                    "model": "nemotron_ocr_v1",
+                    "image": {"path": str(img_path), "height": int(h), "width": int(w)},
+                    "stage2_json": str((prereq_by_image.get(img_path) or {}).get("stage2_json") or ""),
+                    "regions": [],  # Empty regions list
+                    "run": {
+                        "device": str(dev),
+                        "batch_size": int(batch_size),
+                        "resize_to_1024": bool(resize_to_1024),
+                        "ocr_endpoint": str(ocr_endpoint) if ocr_endpoint else None,
+                        "remote_batch_size": int(remote_batch_size),
+                    },
+                }
+                with timers.timed("11_write_json"):
+                    write_json(out_path, payload)
+                
+                processed_images += 1
+            except Exception as e:
+                failed_images += 1
+                console.print(f"[red]Stage5 failed[/red] file={img_path.name} err={type(e).__name__}: {e}")
+            finally:
+                p_imgs.update(1)
             continue
 
         p_imgs.set_postfix(img=f"{img_i}/{len(images)}", file=img_path.name, dets=len(tasks))
+
+        # This should not happen if total_crops > 0, but add a safeguard
+        if ocr is None:
+            console.print(f"[red]Unexpected: tasks present but OCR model not initialized[/red] file={img_path.name}")
+            failed_images += 1
+            p_imgs.update(1)
+            continue
 
         try:
             with timers.timed("06_load_image"):

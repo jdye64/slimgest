@@ -611,6 +611,755 @@ def _gather_results_zip(
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
 
 
+def _run_headless(*, examples: Sequence[ResolvedExample], global_metrics: Dict[str, Any]) -> None:
+    """
+    Display analysis results in a rich CLI format without requiring a display/GUI.
+    """
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich import box
+    
+    # Display global metrics
+    console.print("\n[bold cyan]═══ Global Metrics ═══[/bold cyan]\n")
+    
+    metrics_table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED)
+    metrics_table.add_column("Metric", style="cyan")
+    metrics_table.add_column("Value", style="green")
+    
+    metrics_table.add_row("Total CSV Rows", str(len(examples)))
+    metrics_table.add_row("Unique Pages", str(global_metrics.get("unique_pages", 0)))
+    metrics_table.add_row("Missing Images", str(global_metrics.get("missing_images", 0)))
+    
+    present = global_metrics.get("present", {})
+    metrics_table.add_row("", "")  # separator
+    metrics_table.add_row("Stage 2 (page_elements_v3)", str(present.get("stage2", 0)))
+    metrics_table.add_row("Stage 3 (graphic_elements_v1)", str(present.get("stage3", 0)))
+    metrics_table.add_row("Stage 4 (table_structure_v1)", str(present.get("stage4", 0)))
+    metrics_table.add_row("Stage 5 (nemotron_ocr_v1)", str(present.get("stage5", 0)))
+    metrics_table.add_row("PDFium Text Files", str(present.get("pdfium_text", 0)))
+    metrics_table.add_row("Overlay Images", str(present.get("overlay", 0)))
+    
+    counts = global_metrics.get("counts", {})
+    if counts:
+        metrics_table.add_row("", "")  # separator
+        metrics_table.add_row("Stage 2 Detections", str(counts.get("stage2_detections", 0)))
+        metrics_table.add_row("Stage 3 Detections", str(counts.get("stage3_detections", 0)))
+        metrics_table.add_row("Stage 4 Detections", str(counts.get("stage4_detections", 0)))
+        metrics_table.add_row("Stage 5 Regions", str(counts.get("stage5_regions", 0)))
+    
+    console.print(metrics_table)
+    
+    # Display sample of resolved examples
+    console.print("\n[bold cyan]═══ Sample Pages (first 20) ═══[/bold cyan]\n")
+    
+    samples_table = Table(show_header=True, header_style="bold magenta", box=box.ROUNDED, show_lines=True)
+    samples_table.add_column("PDF Page", style="cyan", width=18)
+    samples_table.add_column("Status", style="yellow", width=10)
+    samples_table.add_column("Query", style="white", width=60)
+    samples_table.add_column("Stages", style="green", width=15)
+    
+    for i, ex in enumerate(examples[:20]):
+        row = ex.row
+        status = "[green]✓ OK[/green]" if ex.image_path is not None else "[red]✗ MISS[/red]"
+        query = row.query[:57] + "..." if len(row.query) > 60 else row.query
+        
+        if ex.image_path is not None and ex.image_path.exists():
+            paths = _paths_for_image(ex.image_path)
+            stages = []
+            if paths["stage2"].exists():
+                stages.append("2")
+            if paths["stage3"].exists():
+                stages.append("3")
+            if paths["stage4"].exists():
+                stages.append("4")
+            if paths["stage5"].exists():
+                stages.append("5")
+            stages_str = ",".join(stages) if stages else "none"
+        else:
+            stages_str = "n/a"
+        
+        samples_table.add_row(row.pdf_page, status, query, stages_str)
+    
+    if len(examples) > 20:
+        console.print(samples_table)
+        console.print(f"\n[dim]... and {len(examples) - 20} more entries[/dim]\n")
+    else:
+        console.print(samples_table)
+        console.print()
+    
+    # Display detailed stats for a few random pages
+    console.print("[bold cyan]═══ Detailed Analysis (3 random pages) ═══[/bold cyan]\n")
+    
+    import random
+    # Filter to pages that actually exist
+    existing_examples = [ex for ex in examples if ex.image_path is not None and ex.image_path.exists()]
+    
+    if existing_examples:
+        sample_count = min(3, len(existing_examples))
+        sampled = random.sample(existing_examples, sample_count)
+        
+        for ex in sampled:
+            summary = _format_summary_for_page(ex.image_path, ex.row)
+            
+            # Create a panel for each page
+            details_lines = []
+            details_lines.append(f"[bold]PDF Page:[/bold] {ex.row.pdf_page}")
+            details_lines.append(f"[bold]Query:[/bold] {ex.row.query}")
+            details_lines.append(f"[bold]Image:[/bold] {ex.image_path}")
+            details_lines.append("")
+            
+            s2 = summary["stage2"]
+            s3 = summary["stage3"]
+            s4 = summary["stage4"]
+            s5 = summary["stage5"]
+            
+            details_lines.append("[bold]Stage Presence:[/bold]")
+            details_lines.append(f"  • Stage 2: {'✓' if s2.get('present') else '✗'} ({s2.get('num_detections', 0)} detections)")
+            details_lines.append(f"  • Stage 3: {'✓' if s3.get('present') else '✗'} ({s3.get('num_regions', 0)} regions, {s3.get('num_detections', 0)} detections)")
+            details_lines.append(f"  • Stage 4: {'✓' if s4.get('present') else '✗'} ({s4.get('num_regions', 0)} regions, {s4.get('num_detections', 0)} detections)")
+            details_lines.append(f"  • Stage 5: {'✓' if s5.get('present') else '✗'} ({s5.get('num_regions', 0)} regions, {s5.get('num_nonempty', 0)} with text)")
+            
+            if s5.get("sample_texts"):
+                details_lines.append("")
+                details_lines.append("[bold]OCR Sample Texts:[/bold]")
+                for t in s5["sample_texts"][:3]:
+                    truncated = t[:80] + "..." if len(t) > 80 else t
+                    details_lines.append(f"  • {truncated}")
+            
+            pdfium = summary.get("pdfium_text", "")
+            if pdfium:
+                details_lines.append("")
+                details_lines.append("[bold]PDFium Text (preview):[/bold]")
+                preview = pdfium[:200] + "..." if len(pdfium) > 200 else pdfium
+                details_lines.append(f"  {preview}")
+            
+            panel = Panel("\n".join(details_lines), title=f"[bold yellow]{ex.row.pdf_page}[/bold yellow]", border_style="blue")
+            console.print(panel)
+            console.print()
+    else:
+        console.print("[yellow]No existing pages found to analyze in detail.[/yellow]\n")
+    
+    # Summary at the end
+    console.print("[bold green]═══ Analysis Complete ═══[/bold green]\n")
+    console.print(f"Processed {len(examples)} rows from CSV")
+    console.print(f"Successfully resolved {len(existing_examples)} pages with images\n")
+
+
+def _run_web_ui(*, examples: Sequence[ResolvedExample], global_metrics: Dict[str, Any], port: int = 8888) -> None:
+    """
+    Start a FastAPI web server to display the analysis in a browser.
+    """
+    try:
+        from fastapi import FastAPI, HTTPException
+        from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+        from fastapi.staticfiles import StaticFiles
+        import uvicorn
+        import base64
+    except ImportError:
+        console.print("[red]Error:[/red] FastAPI and uvicorn are required for --web-ui. Install with: pip install fastapi uvicorn")
+        raise typer.Exit(1)
+    
+    app_fastapi = FastAPI(title="Slimgest Stage999 Post-Mortem Analysis")
+    
+    # Helper to get summary data for a specific index
+    def _get_example_data(idx: int) -> Dict[str, Any]:
+        if idx < 0 or idx >= len(examples):
+            return None
+        
+        ex = examples[idx]
+        row = ex.row
+        
+        result = {
+            "index": idx,
+            "pdf_page": row.pdf_page,
+            "query": row.query,
+            "modality": row.modality,
+            "status": "ok" if ex.image_path is not None else "missing",
+        }
+        
+        if ex.image_path is None or not ex.image_path.exists():
+            return result
+        
+        summary = _format_summary_for_page(ex.image_path, row)
+        paths = summary["paths"]
+        
+        result.update({
+            "image_path": str(ex.image_path),
+            "has_overlay": paths["img_overlay"].exists(),
+            "has_pdfium": paths["pdfium_text"].exists(),
+            "pdfium_text": summary.get("pdfium_text", ""),
+            "embedder_input": _read_text_best_effort(paths["embedder_input"]) if paths["embedder_input"].exists() else "",
+            "stage2": summary["stage2"],
+            "stage3": summary["stage3"],
+            "stage4": summary["stage4"],
+            "stage5": summary["stage5"],
+            "raw": summary["raw"],
+        })
+        
+        return result
+    
+    @app_fastapi.get("/", response_class=HTMLResponse)
+    async def index():
+        html = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Slimgest Stage999 Post-Mortem Analysis</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #f5f5f5;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+        
+        .sidebar {
+            width: 450px;
+            background: white;
+            border-right: 1px solid #ddd;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .sidebar-header {
+            padding: 20px;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        .sidebar-header h1 {
+            font-size: 18px;
+            margin-bottom: 15px;
+            color: #333;
+        }
+        
+        .search-box {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .metrics {
+            padding: 15px 20px;
+            background: #f9f9f9;
+            border-bottom: 1px solid #ddd;
+            font-size: 12px;
+            color: #666;
+        }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        
+        .metric-item {
+            display: flex;
+            justify-content: space-between;
+        }
+        
+        .list-container {
+            flex: 1;
+            overflow-y: auto;
+        }
+        
+        .list-item {
+            padding: 12px 20px;
+            border-bottom: 1px solid #eee;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        
+        .list-item:hover {
+            background: #f9f9f9;
+        }
+        
+        .list-item.selected {
+            background: #e3f2fd;
+            border-left: 3px solid #2196F3;
+        }
+        
+        .list-item-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 4px;
+        }
+        
+        .list-item-query {
+            font-size: 12px;
+            color: #666;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        
+        .list-item-status {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 600;
+            margin-left: 8px;
+        }
+        
+        .list-item-status.ok {
+            background: #c8e6c9;
+            color: #2e7d32;
+        }
+        
+        .list-item-status.missing {
+            background: #ffcdd2;
+            color: #c62828;
+        }
+        
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+        
+        .content-header {
+            padding: 20px;
+            background: white;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        .content-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+        }
+        
+        .content-subtitle {
+            font-size: 13px;
+            color: #666;
+        }
+        
+        .content-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        
+        .images-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        
+        .image-container {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .image-container img {
+            width: 100%;
+            height: auto;
+            border-radius: 4px;
+        }
+        
+        .image-label {
+            font-size: 12px;
+            color: #666;
+            margin-top: 8px;
+            text-align: center;
+        }
+        
+        .tabs {
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .tab-header {
+            display: flex;
+            border-bottom: 1px solid #ddd;
+        }
+        
+        .tab-btn {
+            padding: 12px 20px;
+            border: none;
+            background: none;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            color: #666;
+            border-bottom: 3px solid transparent;
+            transition: all 0.2s;
+        }
+        
+        .tab-btn:hover {
+            background: #f9f9f9;
+        }
+        
+        .tab-btn.active {
+            color: #2196F3;
+            border-bottom-color: #2196F3;
+        }
+        
+        .tab-content {
+            display: none;
+            padding: 20px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .tab-content pre {
+            font-size: 12px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            color: #333;
+        }
+        
+        .stage-summary {
+            font-size: 13px;
+            line-height: 1.8;
+            color: #333;
+        }
+        
+        .stage-summary strong {
+            color: #2196F3;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #999;
+        }
+        
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <h1>📊 Post-Mortem Analysis</h1>
+            <input type="text" class="search-box" id="searchBox" placeholder="Search by query or pdf_page...">
+        </div>
+        <div class="metrics">
+            <div class="metrics-grid" id="metricsGrid">
+                <!-- Metrics will be populated here -->
+            </div>
+        </div>
+        <div class="list-container" id="listContainer">
+            <!-- List items will be populated here -->
+        </div>
+    </div>
+    
+    <div class="main-content">
+        <div class="content-header">
+            <div class="content-title" id="contentTitle">Select an item to view details</div>
+            <div class="content-subtitle" id="contentSubtitle"></div>
+        </div>
+        <div class="content-body" id="contentBody">
+            <div class="empty-state">
+                <div class="empty-state-icon">📄</div>
+                <p>Select a page from the list to view its analysis</p>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let allExamples = [];
+        let filteredExamples = [];
+        let selectedIndex = -1;
+        
+        async function init() {
+            try {
+                const response = await fetch('/api/list');
+                const data = await response.json();
+                allExamples = data.examples;
+                filteredExamples = [...allExamples];
+                
+                renderMetrics(data.global_metrics);
+                renderList();
+                
+                if (filteredExamples.length > 0) {
+                    selectItem(0);
+                }
+            } catch (error) {
+                console.error('Failed to load data:', error);
+            }
+        }
+        
+        function renderMetrics(metrics) {
+            const grid = document.getElementById('metricsGrid');
+            const present = metrics.present || {};
+            const counts = metrics.counts || {};
+            
+            grid.innerHTML = `
+                <div class="metric-item"><span>Total Rows:</span><strong>${allExamples.length}</strong></div>
+                <div class="metric-item"><span>Unique Pages:</span><strong>${metrics.unique_pages}</strong></div>
+                <div class="metric-item"><span>Stage 2:</span><strong>${present.stage2 || 0}</strong></div>
+                <div class="metric-item"><span>Stage 3:</span><strong>${present.stage3 || 0}</strong></div>
+                <div class="metric-item"><span>Stage 4:</span><strong>${present.stage4 || 0}</strong></div>
+                <div class="metric-item"><span>Stage 5:</span><strong>${present.stage5 || 0}</strong></div>
+            `;
+        }
+        
+        function renderList() {
+            const container = document.getElementById('listContainer');
+            container.innerHTML = '';
+            
+            filteredExamples.forEach((ex, i) => {
+                const item = document.createElement('div');
+                item.className = 'list-item' + (i === selectedIndex ? ' selected' : '');
+                item.onclick = () => selectItem(i);
+                
+                const statusClass = ex.status === 'ok' ? 'ok' : 'missing';
+                const statusText = ex.status === 'ok' ? 'OK' : 'MISS';
+                
+                item.innerHTML = `
+                    <div class="list-item-title">
+                        ${ex.pdf_page}
+                        <span class="list-item-status ${statusClass}">${statusText}</span>
+                    </div>
+                    <div class="list-item-query">${ex.query}</div>
+                `;
+                
+                container.appendChild(item);
+            });
+        }
+        
+        async function selectItem(index) {
+            selectedIndex = index;
+            renderList();
+            
+            const ex = filteredExamples[index];
+            
+            document.getElementById('contentTitle').textContent = ex.query;
+            document.getElementById('contentSubtitle').textContent = `${ex.pdf_page}`;
+            
+            if (ex.status !== 'ok') {
+                document.getElementById('contentBody').innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">❌</div>
+                        <p>Image not found for this page</p>
+                    </div>
+                `;
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/details/${ex.index}`);
+                const data = await response.json();
+                
+                renderDetails(data);
+            } catch (error) {
+                console.error('Failed to load details:', error);
+            }
+        }
+        
+        function renderDetails(data) {
+            const body = document.getElementById('contentBody');
+            
+            const imagesHTML = `
+                <div class="images-row">
+                    <div class="image-container">
+                        <img src="/api/image/${data.index}/main" alt="Page image">
+                        <div class="image-label">Original Page</div>
+                    </div>
+                    ${data.has_overlay ? `
+                        <div class="image-container">
+                            <img src="/api/image/${data.index}/overlay" alt="Overlay image">
+                            <div class="image-label">Detection Overlay</div>
+                        </div>
+                    ` : `
+                        <div class="image-container">
+                            <div class="empty-state">
+                                <div class="empty-state-icon">🖼️</div>
+                                <p>No overlay image</p>
+                            </div>
+                        </div>
+                    `}
+                </div>
+            `;
+            
+            const s2 = data.stage2 || {};
+            const s3 = data.stage3 || {};
+            const s4 = data.stage4 || {};
+            const s5 = data.stage5 || {};
+            
+            const summaryHTML = `
+                <div class="stage-summary">
+                    <strong>Stage 2 (page_elements_v3):</strong> 
+                    ${s2.present ? '✓' : '✗'} 
+                    ${s2.num_detections || 0} detections
+                    ${s2.timing_s ? ` (${s2.timing_s.toFixed(2)}s)` : ''}<br>
+                    
+                    <strong>Stage 3 (graphic_elements_v1):</strong> 
+                    ${s3.present ? '✓' : '✗'} 
+                    ${s3.num_regions || 0} regions, 
+                    ${s3.num_detections || 0} detections
+                    ${s3.timing_s ? ` (${s3.timing_s.toFixed(2)}s)` : ''}<br>
+                    
+                    <strong>Stage 4 (table_structure_v1):</strong> 
+                    ${s4.present ? '✓' : '✗'} 
+                    ${s4.num_regions || 0} regions, 
+                    ${s4.num_detections || 0} detections
+                    ${s4.timing_s ? ` (${s4.timing_s.toFixed(2)}s)` : ''}<br>
+                    
+                    <strong>Stage 5 (nemotron_ocr_v1):</strong> 
+                    ${s5.present ? '✓' : '✗'} 
+                    ${s5.num_regions || 0} regions, 
+                    ${s5.num_nonempty || 0} with text<br>
+                    
+                    ${s5.sample_texts && s5.sample_texts.length > 0 ? `
+                        <br><strong>OCR Samples:</strong><br>
+                        ${s5.sample_texts.map(t => `• ${t}`).join('<br>')}
+                    ` : ''}
+                </div>
+            `;
+            
+            const tabsHTML = `
+                <div class="tabs">
+                    <div class="tab-header">
+                        <button class="tab-btn active" onclick="switchTab(0)">Summary</button>
+                        <button class="tab-btn" onclick="switchTab(1)">PDFium Text</button>
+                        <button class="tab-btn" onclick="switchTab(2)">Embedder Input</button>
+                        <button class="tab-btn" onclick="switchTab(3)">Raw JSON</button>
+                    </div>
+                    <div class="tab-content active">${summaryHTML}</div>
+                    <div class="tab-content"><pre>${data.pdfium_text || '(empty)'}</pre></div>
+                    <div class="tab-content"><pre>${data.embedder_input || '(empty)'}</pre></div>
+                    <div class="tab-content"><pre>${JSON.stringify(data.raw, null, 2)}</pre></div>
+                </div>
+            `;
+            
+            body.innerHTML = imagesHTML + tabsHTML;
+        }
+        
+        function switchTab(index) {
+            const btns = document.querySelectorAll('.tab-btn');
+            const contents = document.querySelectorAll('.tab-content');
+            
+            btns.forEach((btn, i) => {
+                btn.classList.toggle('active', i === index);
+            });
+            
+            contents.forEach((content, i) => {
+                content.classList.toggle('active', i === index);
+            });
+        }
+        
+        function filterList() {
+            const query = document.getElementById('searchBox').value.toLowerCase();
+            
+            if (!query) {
+                filteredExamples = [...allExamples];
+            } else {
+                filteredExamples = allExamples.filter(ex => 
+                    ex.pdf_page.toLowerCase().includes(query) ||
+                    ex.query.toLowerCase().includes(query)
+                );
+            }
+            
+            selectedIndex = -1;
+            renderList();
+            
+            if (filteredExamples.length > 0) {
+                selectItem(0);
+            } else {
+                document.getElementById('contentBody').innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">🔍</div>
+                        <p>No results found</p>
+                    </div>
+                `;
+            }
+        }
+        
+        document.getElementById('searchBox').addEventListener('input', filterList);
+        
+        init();
+    </script>
+</body>
+</html>
+        """
+        return HTMLResponse(content=html)
+    
+    @app_fastapi.get("/api/list")
+    async def api_list():
+        """Return list of all examples with basic info"""
+        examples_list = []
+        for i, ex in enumerate(examples):
+            examples_list.append({
+                "index": i,
+                "pdf_page": ex.row.pdf_page,
+                "query": ex.row.query,
+                "status": "ok" if ex.image_path is not None else "missing",
+            })
+        
+        return JSONResponse({
+            "examples": examples_list,
+            "global_metrics": global_metrics,
+        })
+    
+    @app_fastapi.get("/api/details/{index}")
+    async def api_details(index: int):
+        """Return detailed data for a specific example"""
+        data = _get_example_data(index)
+        if data is None:
+            raise HTTPException(status_code=404, detail="Example not found")
+        return JSONResponse(data)
+    
+    @app_fastapi.get("/api/image/{index}/{image_type}")
+    async def api_image(index: int, image_type: str):
+        """Serve the image file for a specific example"""
+        if index < 0 or index >= len(examples):
+            raise HTTPException(status_code=404, detail="Example not found")
+        
+        ex = examples[index]
+        if ex.image_path is None or not ex.image_path.exists():
+            raise HTTPException(status_code=404, detail="Image not found")
+        
+        paths = _paths_for_image(ex.image_path)
+        
+        if image_type == "main":
+            image_path = paths["img"]
+        elif image_type == "overlay":
+            image_path = paths["img_overlay"]
+        else:
+            raise HTTPException(status_code=400, detail="Invalid image type")
+        
+        if not image_path.exists():
+            raise HTTPException(status_code=404, detail="Image file not found")
+        
+        return FileResponse(image_path)
+    
+    console.print(f"[bold green]Starting web UI server on port {port}...[/bold green]")
+    console.print(f"[cyan]Open your browser to: http://localhost:{port}[/cyan]")
+    console.print("[yellow]Press Ctrl+C to stop the server[/yellow]\n")
+    
+    uvicorn.run(app_fastapi, host="0.0.0.0", port=port, log_level="info")
+
+
 def _run_ui(*, examples: Sequence[ResolvedExample], global_metrics: Dict[str, Any]) -> None:
     # Tk is stdlib; pillow is project dependency.
     import tkinter as tk
@@ -935,11 +1684,30 @@ def run(
         help="Optional limit on number of unique pages included in the gathered .zip.",
     ),
     also_ui: bool = typer.Option(False, "--also-ui", help="If --export-pdf is set, still open the UI after exporting."),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="Run in headless mode without GUI. Displays analysis in rich CLI format instead of opening interactive UI. If not set, automatically enables headless mode when no DISPLAY is available.",
+    ),
+    web_ui: bool = typer.Option(
+        False,
+        "--web-ui",
+        help="Start a web UI server (FastAPI) instead of the desktop UI. Access at http://localhost:8888",
+    ),
+    port: int = typer.Option(
+        8888,
+        "--port",
+        help="Port for the web UI server (only used with --web-ui).",
+    ),
 ):
     """
     Default behavior: open an interactive UI viewer over pages referenced in the CSV.
 
     If --export-pdf is provided, creates a shareable report PDF containing the same information.
+    
+    If --headless is provided, runs without GUI and displays analysis in CLI format.
+    
+    If --web-ui is provided, starts a FastAPI web server for browser-based viewing.
     """
     input_dir = Path(input_dir)
     csv_path = Path(csv_path)
@@ -992,7 +1760,23 @@ def run(
         )
         console.print(f"[green]Gather complete[/green] output={out_zip}")
 
-    _run_ui(examples=resolved, global_metrics=global_metrics)
+    # Choose display mode: headless CLI or interactive GUI
+    # Auto-detect headless environment if not explicitly set
+    if web_ui:
+        # Web UI mode takes precedence
+        _run_web_ui(examples=resolved, global_metrics=global_metrics, port=port)
+    elif not headless:
+        import os
+        # If no DISPLAY variable is set and headless not explicitly requested,
+        # automatically use headless mode
+        if not os.environ.get("DISPLAY"):
+            console.print("[yellow]No DISPLAY detected - automatically using headless mode[/yellow]")
+            headless = True
+    
+    if headless and not web_ui:
+        _run_headless(examples=resolved, global_metrics=global_metrics)
+    elif not web_ui:
+        _run_ui(examples=resolved, global_metrics=global_metrics)
 
 
 def main() -> None:

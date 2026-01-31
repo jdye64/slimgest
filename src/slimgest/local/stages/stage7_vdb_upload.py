@@ -41,6 +41,7 @@ def run(
     bad_stage5 = 0
     missing_pdfium_text = 0
     full_chunks = []
+    chunks_appended = 0
     for file_path in tqdm(files_to_read, desc="Stage7 creating_chunks", unit="pt file"):
         # create chunks
         with open(file_path, "rb") as f:
@@ -54,6 +55,7 @@ def run(
                     "page_number": int(file_path.split("_page")[-1].split(".")[0]),
                 }
                 full_chunks.append(chunk)
+                chunks_appended += 1
             else:
                 skipped += 1
 
@@ -62,11 +64,15 @@ def run(
     vdb = LanceDB(overwrite=True)
     vdb.run(full_chunks)
 
-    processed = vdb.table.count_rows()
+    chunks_written_to_lancedb = vdb.table.count_rows()
 
     console.print(
         f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage5={missing_stage5} bad_stage5={bad_stage5} "
         f"missing_pdfium_text={missing_pdfium_text} wrote_pt_suffix=.embeddings.pt"
+    )
+    console.print(
+        f"[bold yellow]Chunk Stats[/bold yellow] chunks_appended_to_full_chunks={chunks_appended} "
+        f"chunks_written_to_lancedb={chunks_written_to_lancedb}"
     )
 
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import csv
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -130,6 +132,9 @@ def run(
         f"[bold cyan]Stage6[/bold cyan] images={len(images)} input_dir={input_dir} device={dev} hf_cache_dir={hf_cache_dir}"
     )
 
+    # Track all skipped items with reasons
+    skip_records: List[Dict[str, str]] = []
+    
     chunks_created = 0
     processed = 0
     skipped = 0
@@ -143,26 +148,49 @@ def run(
         out_path = _out_path_for_image(img_path)
         if out_path.exists() and not overwrite:
             skipped += 1
+            skip_records.append({
+                "image_path": str(img_path),
+                "reason": "already_exists",
+                "details": f"Output file {out_path.name} already exists and --overwrite not set"
+            })
             continue
 
         s5_path = _stage5_json_for_image(img_path)
-        if not s5_path.exists():
-            missing_stage5 += 1
-            continue
-
         pdfium_text_path = _pdfium_text_for_image(img_path)
         pdfium_text = ""
+        
+        # Read pdfium text if available
         if pdfium_text_path.exists():
             pdfium_text = _read_text_file_best_effort(pdfium_text_path)
         else:
             missing_pdfium_text += 1
 
-        try:
-            s5 = read_json(s5_path)
-        except Exception:
-            bad_stage5 += 1
+        # Try to read stage5 results, but allow processing to continue without them
+        regions: List[Dict[str, Any]] = []
+        stage5_status = ""
+        if s5_path.exists():
+            try:
+                s5 = read_json(s5_path)
+                regions = list(s5.get("regions") or [])
+                stage5_status = "found"
+            except Exception as e:
+                bad_stage5 += 1
+                stage5_status = f"error: {str(e)}"
+                # Continue with empty regions - we may still have pdfium_text
+        else:
+            missing_stage5 += 1
+            stage5_status = "missing"
+            # Continue with empty regions - we may still have pdfium_text
+        
+        # If we have neither stage5 regions nor pdfium_text, skip this image
+        if not regions and not pdfium_text:
+            skipped += 1
+            skip_records.append({
+                "image_path": str(img_path),
+                "reason": "no_content",
+                "details": f"No stage5 regions ({stage5_status}) and no pdfium_text"
+            })
             continue
-        regions: List[Dict[str, Any]] = list(s5.get("regions") or [])
         texts: List[str] = []
         bboxes: List[List[float]] = []
         text_kinds: List[str] = []
@@ -188,8 +216,6 @@ def run(
                 text_kinds.append("ocr_region")
                 ocr_added += 1
 
-        if len(texts) ==0:
-            skipped += 1
         t0 = time.perf_counter()
         vectors: List[torch.Tensor] = []
         try:
@@ -211,6 +237,11 @@ def run(
                         vectors.append(emb[i].cpu().numpy().astype(np.float32))
         except torch.cuda.OutOfMemoryError as e:
             oom_errors += 1
+            skip_records.append({
+                "image_path": str(img_path),
+                "reason": "cuda_oom",
+                "details": f"CUDA OutOfMemoryError: {str(e)}"
+            })
             console.print(
                 f"[bold red]CUDA OOM[/bold red] while embedding {img_path} "
                 f"(skipping this page and continuing): {e}"
@@ -227,6 +258,11 @@ def run(
             msg = str(e)
             if "CUDA out of memory" in msg or "cuda out of memory" in msg:
                 oom_errors += 1
+                skip_records.append({
+                    "image_path": str(img_path),
+                    "reason": "cuda_oom_runtime",
+                    "details": f"RuntimeError CUDA OOM: {str(e)}"
+                })
                 console.print(
                     f"[bold red]CUDA OOM[/bold red] while embedding {img_path} "
                     f"(skipping this page and continuing): {e}"
@@ -273,6 +309,19 @@ def run(
             out_path,
         )
         processed += 1
+
+    # Write skip records to CSV file
+    if skip_records:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        skip_log_path = input_dir / f"stage6_skipped_{timestamp}.csv"
+        try:
+            with open(skip_log_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["image_path", "reason", "details"])
+                writer.writeheader()
+                writer.writerows(skip_records)
+            console.print(f"[yellow]Wrote skip log to:[/yellow] {skip_log_path} ({len(skip_records)} items)")
+        except Exception as e:
+            console.print(f"[red]Warning: Failed to write skip log:[/red] {e}")
 
     console.print(
         f"[green]Done[/green] processed={processed} skipped={skipped} missing_stage5={missing_stage5} bad_stage5={bad_stage5} "

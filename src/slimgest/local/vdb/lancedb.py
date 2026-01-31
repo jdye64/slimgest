@@ -190,7 +190,7 @@ class LanceDB(VDB):
         embed_model=None,
         nvidia_api_key=None,
         model_name="nvidia/llama-3.2-nv-embedqa-1b-v2",
-        result_fields=["text", "metadata", "source"],
+        result_fields=["text", "metadata", "source", "_distance"],
         top_k=10,
         **kwargs
     ):
@@ -218,7 +218,7 @@ class LanceDB(VDB):
             "nvidia/llama-3.2-nv-embedqa-1b-v2").
         result_fields : list, optional
             List of field names to retrieve from each hit document (default is
-            `["text", "metadata", "source"]`).
+            `["text", "metadata", "source", "_distance"]`).
         top_k : int, optional
             Number of top results to return per query (default is 10).
 
